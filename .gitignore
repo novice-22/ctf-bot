@@ -1,0 +1,23 @@
+# 인증정보 — 절대 커밋 금지
+.env
+*.token
+
+# DB / 백업 (팀 기록 + 플래그 + 대화 내용이 들어있음)
+*.db
+*.sqlite
+*.sqlite3
+backups/
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# 에디터/OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

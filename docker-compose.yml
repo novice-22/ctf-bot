@@ -1,0 +1,46 @@
+# CTF 봇은 웹 서비스가 아니다. 디스코드로 나가는 연결만 유지하고
+# 들어오는 요청은 받지 않으므로 포트를 열지 않는다.
+
+services:
+  ctf-bot:
+    build: .
+    image: ctf-bot:latest
+    container_name: ctf-bot
+    restart: unless-stopped
+
+    # 토큰은 이미지에 굽지 않고, 호스트의 .env 를 compose 가 읽어 환경변수로만 넘긴다.
+    # 파일 자체를 마운트하지 않으므로 컨테이너 안에는 토큰 파일이 존재하지 않는다.
+    env_file:
+      - .env
+
+    volumes:
+      - ctfbot_data:/data
+
+    # 봇에게 리눅스 특수권한은 하나도 필요 없다.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # 파일시스템을 통째로 읽기 전용으로 잠근다. 쓰기가 되는 곳은 /data 볼륨과
+    # 임시 파일용 /tmp 뿐이라, 침입해도 코드를 심어둘 자리가 없다.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    # 폭주해도 같은 서버의 다른 서비스가 굶지 않게 상한을 둔다.
+    # 평소 사용량은 150MB 안팎이라 넉넉한 값이다.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ctfbot_data:
