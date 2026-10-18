@@ -561,10 +561,13 @@ class CTF(commands.Cog):
         elif url:
             message += (
                 f"\n🔗 대회 주소 연결됨: {url}\n"
-                f"토큰까지 주면 시작할 때 자동으로 가져와 — `token:` 옵션이나 `/ctf import`."
+                f"`/ctf creds token:토큰` 으로 토큰까지 저장하면 시작할 때 자동으로 가져와."
             )
         elif token:
-            message += "\n⚠️ 토큰만 받고 대회 주소(url)가 없어서 저장 못 했어. `url:` 도 같이 줘."
+            message += (
+                "\n⚠️ 토큰만 받고 대회 주소(url)가 없어서 저장 못 했어. "
+                "`/ctf creds url:대회주소 token:토큰` 으로 넣어줘."
+            )
 
         # 비공개 대회는 디스코드 이벤트를 안 만든다 — 이벤트는 서버 전체에 이름이 보여서다.
         if private:
@@ -700,10 +703,10 @@ class CTF(commands.Cog):
         embed.add_field(
             name="📥 문제 불러오기",
             value=(
-                "`/ctf import url:https://ctf.site token:토큰` 🔒\n"
-                "→ 처음 한 번 전체 불러오기\n"
+                "`/ctf creds url:https://ctf.site token:토큰` 🔒\n"
+                "→ 주소·토큰 저장 (저장하면 바로 연결 확인, 토큰만 바꿀 땐 `token:` 만)\n"
+                "`/ctf import` 🔒 → 처음 한 번 전체 불러오기\n"
                 "`/ctf pull` → 새로 나온 문제만 추가 (누구나)\n"
-                "`/ctf creds token:새토큰` 🔒 → 토큰 저장·변경 (저장하면 바로 연결 확인)\n"
                 "`/ctf creds check:True` 🔒 → 지금 저장된 주소·토큰이 실제로 되는지 확인\n"
                 "지원: CTFd · rCTF · noCTF · GZCTF (GZCTF는 `…/games/번호` 주소)"
             ),
@@ -902,8 +905,13 @@ class CTF(commands.Cog):
             return
 
         if not ctf["ctfd_url"] or not ctf["api_token"]:
+            # 저장은 /ctf creds 로만 된다 (/ctf import 에 준 주소·토큰은 그 한 번만 쓰고 저장 안 함).
+            missing = "·".join(
+                w for w, v in (("주소", ctf["ctfd_url"]), ("토큰", ctf["api_token"])) if not v
+            )
             await interaction.followup.send(
-                "아직 대회 사이트를 연결 안 했어. `/ctf import` 로 주소와 토큰을 한 번 넣어줘.",
+                f"아직 대회 {missing}이(가) 저장 안 돼 있어.\n"
+                "**lead** 가 `/ctf creds url:대회주소 token:토큰` 으로 저장하면 그다음부터 `/ctf pull` 이 돼.",
                 ephemeral=True,
             )
             return
