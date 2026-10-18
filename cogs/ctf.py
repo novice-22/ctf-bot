@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta
@@ -52,15 +53,67 @@ def _stored_dt(value: str | None) -> datetime | None:
 def _progress_reporter(interaction: discord.Interaction):
     """임포트 진행률을 본인만 보이는 메시지로 갱신하는 콜백을 만든다."""
 
-    async def report(done: int, total: int) -> None:
-        try:
-            await interaction.edit_original_response(
-                content=f"⏳ 문제 가져오는 중… {done}/{total}"
+    async def report(done: int, total: int, phase: str = "create") -> None:
+        # 단계마다 다르게 보여준다 — 대회 서버가 느리면 목록·상세 받는 데만 몇 분 걸려서,
+        # 진행 표시가 없으면 "생각 중"에서 멈춘 것처럼 보인다.
+        if phase == "join":
+            # done 자리에 "몇 초째 진행 중인지"가 들어온다.
+            text = (
+                f"⏳ 이미 이 대회 문제를 불러오는 중이야 ({done}초째) — "
+                "다시 안 눌러도 돼, 끝나면 같은 결과를 여기 보여줄게"
             )
+        elif phase == "connect":
+            text = "⏳ 대회 서버에서 문제 목록 받는 중… (서버가 느리면 몇 분 걸릴 수 있어)"
+        elif phase == "fetch":
+            text = f"⏳ 새 문제 정보 받는 중… {done}/{total}"
+        else:
+            text = f"⏳ 문제 스레드 만드는 중… {done}/{total}"
+        try:
+            await interaction.edit_original_response(content=text)
         except discord.HTTPException:
             pass
 
     return report
+
+
+PLATFORM_NAMES = {"ctfd": "CTFd", "rctf": "rCTF", "noctf": "noCTF", "gzctf": "GZCTF"}
+
+
+async def _verify_credentials(ctf) -> str:
+    """저장된 주소·토큰으로 문제 '목록'만 한 번 받아본다. 결과를 한 줄로 돌려준다.
+
+    상세(설명·첨부)는 안 받는다 — 모든 문제를 '이미 있음'으로 취급해 상세 요청이 0번이라,
+    대회 서버엔 목록 요청 한두 번만 간다. 실패해도 예외를 던지지 않는다 (저장은 이미 됐다).
+    """
+    ctx = platforms.FetchContext(skip=lambda remote_id, name: True)
+    try:
+        detected, challenges = await platforms.fetch_challenges(
+            ctf["ctfd_url"], ctf["api_token"], ctf["platform"] or "auto", ctx
+        )
+    except platforms.PlatformUnavailable:
+        return "⏳ 대회 서버가 응답이 없어서 지금은 확인 못 했어 (저장은 됐어)"
+    except platforms.PlatformError as exc:
+        return f"⚠️ {exc}"
+    except Exception as exc:
+        log.exception("자격 확인 중 오류")
+        return f"⚠️ 확인 중 오류: {str(exc) or type(exc).__name__}"
+
+    text = f"✅ {PLATFORM_NAMES.get(detected, detected)} 연결 정상 — 지금 문제 {len(challenges)}개 보여"
+    if ctf["auto_imported"]:
+        # 자동 수집은 이미 끝났으니(실패했을 수도) 지금 직접 불러오라고 알려준다.
+        text += " → 이제 `/ctf pull` 하면 불러와"
+    return text
+
+
+async def _finish_progress(interaction: discord.Interaction, text: str) -> None:
+    """진행률(⏳) 메시지를 최종 결과로 바꿔 마무리한다. 편집이 안 되면 새로 보낸다."""
+    # 디스코드 메시지는 2000자 제한 — 넘으면 편집·전송이 둘 다 거부돼 결과가 사라진다.
+    if len(text) > 1900:
+        text = text[:1900] + "…"
+    try:
+        await interaction.edit_original_response(content=text)
+    except discord.HTTPException:
+        await interaction.followup.send(text, ephemeral=True)
 
 
 # 슬래시 명령어는 인원 수가 정해지지 않은 목록을 못 받는다. 그래서 문자열로 받아
@@ -121,6 +174,31 @@ def _is_command_channel(channel) -> bool:
     """지정된 커맨드 채널인지. 카테고리 밖에서 대회 이름을 받아 실행할 때 허용한다."""
     name = structure.strip_emoji(getattr(channel, "name", "") or "")
     return name in COMMAND_CHANNEL_NAMES
+
+
+# 대회 생성·초대 같은 관리 명령은 이 역할(대소문자 무시)만 쓸 수 있다. 서버 관리자는 항상 허용.
+LEAD_ROLE_NAMES = ("lead",)
+
+
+def _has_lead(member) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator:
+        return True
+    return any(r.name.lower() in LEAD_ROLE_NAMES for r in member.roles)
+
+
+def lead_only():
+    """lead 역할(또는 관리자)만 통과시키는 앱 커맨드 체크."""
+
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if _has_lead(interaction.user):
+            return True
+        raise app_commands.CheckFailure(
+            "이건 **lead** 역할만 쓸 수 있는 명령이야."
+        )
+
+    return app_commands.check(predicate)
 
 
 async def _any_ctf_autocomplete(
@@ -186,7 +264,13 @@ async def _member_autocomplete(
 
     ctf = await _resolve_ctf(interaction)
     role = guild.get_role(ctf["role_id"]) if ctf else None
-    pool = role.members if role is not None else guild.members
+    # 참가자(역할 보유자)를 먼저 제안하되, 역할이 없어도 도운 사람을 크레딧할 수 있게
+    # 나머지 서버 멤버도 뒤에 포함한다 (운영자 권한으로만 보는 사람 등).
+    if role is not None:
+        role_ids = {m.id for m in role.members}
+        pool = list(role.members) + [m for m in guild.members if m.id not in role_ids]
+    else:
+        pool = guild.members
 
     chosen = _parse_mentions(current)
     prefix = " ".join(f"<@{uid}>" for uid in chosen)
@@ -254,6 +338,103 @@ async def _challenge_autocomplete(
     ][:25]
 
 
+# /ctf invite·kick 에서 쓰는 멤버 다중 선택 드롭다운.
+# 봇이 멤버 목록을 직접 채워서, 대상 전원이 한눈에 보이게 한다 (디스코드 기본 UserSelect 는
+# 몇 명씩만 보여주고 검색해야 해서, 목록형 Select 로 만든다). 옵션은 최대 25개.
+MEMBER_SELECT_LIMIT = 25
+
+
+class _MemberActionSelect(discord.ui.Select):
+    def __init__(self, ctf_id: int, role_id: int, mode: str, members: list) -> None:
+        verb = "초대할" if mode == "invite" else "내보낼"
+        options = [
+            discord.SelectOption(
+                label=m.display_name[:100],
+                value=str(m.id),
+                description=f"@{m.name}"[:100],
+            )
+            for m in members[:MEMBER_SELECT_LIMIT]
+        ]
+        super().__init__(
+            placeholder=f"{verb} 사람을 골라줘 (여러 명 가능)",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+        self.ctf_id = ctf_id
+        self.role_id = role_id
+        self.mode = mode
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        # 드롭다운을 지우고 "처리 중"으로 바꾼 뒤 실제 작업을 한다 (역할·스레드는 시간이 걸린다).
+        await interaction.response.edit_message(content="⏳ 처리 중…", view=None)
+        guild = interaction.guild
+        role = guild.get_role(self.role_id)
+        if role is None:
+            await interaction.edit_original_response(content="이 대회의 참가 역할을 못 찾았어.")
+            return
+
+        ids = [int(v) for v in self.values]
+        if self.mode == "invite":
+            threads = []
+            for ch in await db.list_challenges(self.ctf_id):
+                th = guild.get_channel_or_thread(ch["thread_id"])
+                if isinstance(th, discord.Thread):
+                    threads.append(th)
+            done, failed = [], []
+            for uid in ids:
+                member = guild.get_member(uid)
+                if member is None:
+                    failed.append(f"<@{uid}>")
+                    continue
+                try:
+                    await member.add_roles(role, reason="CTF 초대 (invite)")
+                except discord.HTTPException:
+                    failed.append(member.mention)
+                    continue
+                for th in threads:
+                    try:
+                        await th.add_user(member)
+                    except discord.HTTPException:
+                        pass
+                    await asyncio.sleep(0.2)
+                done.append(member.mention)
+            parts = []
+            if done:
+                parts.append(f"✅ 참여시킴: {', '.join(done)}")
+            if failed:
+                parts.append(
+                    f"⚠️ 실패: {', '.join(failed)} — 봇 역할이 대회 역할보다 위에 있는지 확인해줘."
+                )
+        else:  # kick
+            done, missing = [], []
+            for uid in ids:
+                member = guild.get_member(uid)
+                if member is None or role not in member.roles:
+                    missing.append(f"<@{uid}>")
+                    continue
+                try:
+                    await member.remove_roles(role, reason="CTF 내보내기 (kick)")
+                    done.append(member.mention)
+                except discord.HTTPException:
+                    missing.append(member.mention)
+            parts = []
+            if done:
+                parts.append(f"✅ 내보냄: {', '.join(done)}")
+            if missing:
+                parts.append(f"⚠️ 대상 아님/실패: {', '.join(missing)}")
+
+        await interaction.edit_original_response(
+            content="\n".join(parts) or "아무도 안 바뀌었어."
+        )
+
+
+class _MemberActionView(discord.ui.View):
+    def __init__(self, ctf_id: int, role_id: int, mode: str, members: list) -> None:
+        super().__init__(timeout=300)
+        self.add_item(_MemberActionSelect(ctf_id, role_id, mode, members))
+
+
 class CTF(commands.Cog):
     group = app_commands.Group(name="ctf", description="CTF 관리", guild_only=True)
 
@@ -270,8 +451,9 @@ class CTF(commands.Cog):
         token="토큰/쿠키. 넣어두면 시작할 때 문제를 자동으로 가져와 (CTFd·rCTF·noCTF·GZCTF)",
         starts="대회 시작 시각 (예: 2026-08-01 09:00). CTFtime 값을 덮어써",
         ends="대회 종료 시각 (예: 2026-08-02 21:00). 넣으면 3일 뒤 자동 아카이브",
+        private="비공개로 만들래? 공지·참가버튼·디스코드 이벤트를 안 만들어 (지정한 사람만 /ctf invite 로 추가)",
     )
-    @app_commands.checks.has_permissions(manage_channels=True)
+    @lead_only()
     async def new(
         self,
         interaction: discord.Interaction,
@@ -281,11 +463,13 @@ class CTF(commands.Cog):
         token: str | None = None,
         starts: str | None = None,
         ends: str | None = None,
+        private: bool = False,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
         # CTFtime 번호를 주면 이름·일정·주소를 채운다. 직접 적은 값이 언제나 우선.
         starts_at = ends_at = None
+        ctftime_link = None
         if ctftime:
             event_id = ctftime_api.parse_event_ref(ctftime)
             if event_id is None:
@@ -302,6 +486,7 @@ class CTF(commands.Cog):
             name = name or event["title"]
             url = url or event["url"] or None
             starts_at, ends_at = event["start"], event["finish"]
+            ctftime_link = f"https://ctftime.org/event/{event['id']}"
 
         if not name:
             await interaction.followup.send(
@@ -330,18 +515,20 @@ class CTF(commands.Cog):
                 else:
                     ends_at = parsed
 
-        # 참가 공지는 항상 공지 채널(ctf-notice)에만 올린다.
-        # 명령을 친 채널에는 올리지 않는다 — 대회 카테고리는 참가자에게만 보이므로
-        # 공지가 모두에게 보이는 곳에 있어야 의미가 있다.
-        notice = structure.find_notice_channel(interaction.guild)
-        if notice is None:
-            await interaction.followup.send(
-                "공지 채널이 없어서 대회를 안 만들었어.\n"
-                f"`ctf-notice` 채널을 만들고 다시 실행해줘. "
-                f"(찾는 이름: {', '.join(structure.NOTICE_CHANNEL_NAMES)})",
-                ephemeral=True,
-            )
-            return
+        # 공개 대회는 참가 공지를 공지 채널(ctf-notice)에 올린다. 명령 친 채널에는 안 올린다 —
+        # 대회 카테고리는 참가자에게만 보이므로 공지는 모두 보이는 곳에 있어야 의미가 있다.
+        # 비공개(private) 대회는 공지·참가버튼을 아예 안 올리므로 공지 채널이 없어도 된다.
+        notice = None
+        if not private:
+            notice = structure.find_notice_channel(interaction.guild)
+            if notice is None:
+                await interaction.followup.send(
+                    "공지 채널이 없어서 대회를 안 만들었어.\n"
+                    f"`ctf-notice` 채널을 만들고 다시 실행해줘. "
+                    f"(찾는 이름: {', '.join(structure.NOTICE_CHANNEL_NAMES)})",
+                    ephemeral=True,
+                )
+                return
 
         ctf_id, category = await structure.create_ctf(
             interaction.guild, name, starts_at=starts_at, ends_at=ends_at
@@ -351,18 +538,24 @@ class CTF(commands.Cog):
             await db.set_credentials(ctf_id, url, token, "auto")
         elif url:
             await db.set_ctf_url(ctf_id, url)
-        log.info("CTF 생성: %s (id=%s, %s ~ %s)", name, ctf_id, starts_at, ends_at)
+        log.info("CTF 생성: %s (id=%s, %s ~ %s, private=%s)", name, ctf_id, starts_at, ends_at, private)
 
-        try:
-            await views.post_announcement(notice, ctf_id, name, starts_at, ends_at)
-        except discord.HTTPException:
-            await interaction.followup.send(
-                f"**{name}** 은 만들었는데 {notice.mention} 에 공지를 못 올렸어. "
-                f"봇이 그 채널에 쓸 수 있는지 확인해줘.",
-                ephemeral=True,
+        if private:
+            message = (
+                f"🔒 **{name}** 을 비공개로 만들었어. 공지·참가버튼·디스코드 이벤트는 안 올렸어.\n"
+                f"참여시킬 사람은 이 대회 카테고리 안에서 `/ctf invite @사람들` 로 추가해줘."
             )
-            return
-        message = f"**{name}** 만들었어. {notice.mention} 에 참가 공지 올렸어."
+        else:
+            try:
+                await views.post_announcement(notice, ctf_id, name, starts_at, ends_at)
+            except discord.HTTPException:
+                await interaction.followup.send(
+                    f"**{name}** 은 만들었는데 {notice.mention} 에 공지를 못 올렸어. "
+                    f"봇이 그 채널에 쓸 수 있는지 확인해줘.",
+                    ephemeral=True,
+                )
+                return
+            message = f"**{name}** 만들었어. {notice.mention} 에 참가 공지 올렸어."
         if url and token:
             message += "\n🔗 주소·토큰 저장 완료 — 시작하면 문제를 자동으로 가져올게."
         elif url:
@@ -372,34 +565,251 @@ class CTF(commands.Cog):
             )
         elif token:
             message += "\n⚠️ 토큰만 받고 대회 주소(url)가 없어서 저장 못 했어. `url:` 도 같이 줘."
+
+        # 비공개 대회는 디스코드 이벤트를 안 만든다 — 이벤트는 서버 전체에 이름이 보여서다.
+        if private:
+            if starts_at and ends_at:
+                message += "\n(비공개라 디스코드 이벤트는 안 만들었어.)"
+            await interaction.followup.send(message, ephemeral=True)
+            return
+
+        # 일정이 다 있으면 디스코드 예약 이벤트도 만든다. 이 이벤트가 다시
+        # on_scheduled_event_create 를 부르지만, 방금 만든 대회를 이름으로 찾아
+        # 건너뛰므로 중복 생성되지 않는다. (external 이벤트라 시작·종료·위치가 필수)
+        if starts_at and ends_at:
+            kwargs = dict(
+                name=name,
+                start_time=starts_at,
+                end_time=ends_at,
+                entity_type=discord.EntityType.external,
+                privacy_level=discord.PrivacyLevel.guild_only,
+                location=(url or ctftime_link or name)[:100],
+                reason="CTF 대회 이벤트",
+            )
+            if ctftime_link:
+                kwargs["description"] = f"CTFtime: {ctftime_link}"
+            try:
+                sched = await interaction.guild.create_scheduled_event(**kwargs)
+                await db.set_ctf_event(ctf_id, sched.id)
+                message += "\n📅 디스코드 이벤트도 만들었어."
+            except discord.Forbidden:
+                message += (
+                    "\n⚠️ 디스코드 이벤트는 못 만들었어 — 봇에 **이벤트 관리(Manage Events)** 권한을 줘."
+                )
+            except discord.HTTPException as exc:
+                message += f"\n⚠️ 디스코드 이벤트 생성 실패: {exc}"
+        elif ctftime or starts or ends:
+            message += "\n(일정이 없어서 디스코드 이벤트는 안 만들었어 — `starts:`·`ends:` 둘 다 있어야 해.)"
+
         await interaction.followup.send(message, ephemeral=True)
 
-    @group.command(name="upcoming", description="CTFtime 예정 대회를 보여줄게")
-    @app_commands.describe(limit="몇 개 볼래? (기본 5, 최대 10)")
-    async def upcoming(self, interaction: discord.Interaction, limit: int = 5) -> None:
+    @group.command(name="invite", description="지정한 사람만 이 대회에 참여시킬게 (비공개 대회용)")
+    @lead_only()
+    async def invite(self, interaction: discord.Interaction) -> None:
+        ctf = await _resolve_ctf(interaction)
+        if ctf is None:
+            await interaction.response.send_message(
+                "대회 카테고리 안에서 실행해줘.", ephemeral=True
+            )
+            return
+        role = interaction.guild.get_role(ctf["role_id"]) if ctf["role_id"] else None
+        if role is None:
+            await interaction.response.send_message(
+                "이 대회의 참가 역할을 못 찾았어.", ephemeral=True
+            )
+            return
+        # 봇을 뺀 서버 멤버 전원 (이름순). 아직 참가 안 한 사람이 위로 오게 정렬.
+        members = sorted(
+            (m for m in interaction.guild.members if not m.bot),
+            key=lambda m: (role in m.roles, m.display_name.lower()),
+        )
+        if not members:
+            await interaction.response.send_message("초대할 멤버가 없어.", ephemeral=True)
+            return
+        note = ""
+        if len(members) > MEMBER_SELECT_LIMIT:
+            note = f"\n(멤버가 많아 {MEMBER_SELECT_LIMIT}명까지만 목록에 떠 — 더 있으면 나눠서 초대해줘.)"
+        await interaction.response.send_message(
+            "초대할 사람을 골라줘 — 한 번에 여러 명 선택 가능:" + note,
+            view=_MemberActionView(ctf["id"], ctf["role_id"], "invite", members),
+            ephemeral=True,
+        )
+
+    @group.command(name="kick", description="이 대회에서 내보낼게 (참가 역할 회수)")
+    @lead_only()
+    async def kick(self, interaction: discord.Interaction) -> None:
+        ctf = await _resolve_ctf(interaction)
+        if ctf is None:
+            await interaction.response.send_message(
+                "대회 카테고리 안에서 실행해줘.", ephemeral=True
+            )
+            return
+        role = interaction.guild.get_role(ctf["role_id"]) if ctf["role_id"] else None
+        if role is None:
+            await interaction.response.send_message(
+                "이 대회의 참가 역할을 못 찾았어.", ephemeral=True
+            )
+            return
+        # 내보내기 대상은 현재 참가자(역할 보유자)만 목록에 띄운다.
+        members = sorted(
+            (m for m in role.members if not m.bot),
+            key=lambda m: m.display_name.lower(),
+        )
+        if not members:
+            await interaction.response.send_message(
+                "이 대회에 참가자가 없어.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            "내보낼 사람을 골라줘 (여러 명 선택 가능):",
+            view=_MemberActionView(ctf["id"], ctf["role_id"], "kick", members),
+            ephemeral=True,
+        )
+
+    @group.command(name="help", description="명령어 사용법을 간단히 보여줄게 (나만 보임)")
+    async def help_(self, interaction: discord.Interaction) -> None:
+        embed = discord.Embed(
+            title="📖 /ctf 명령어 안내",
+            description=(
+                "🔒 = **lead** 역할만 사용 가능\n"
+                "대부분 **대회 카테고리 안 채널**에서 실행해 (솔브는 **문제 스레드 안**)"
+            ),
+            colour=discord.Colour.blurple(),
+        )
+        embed.add_field(
+            name="🏁 대회 만들기 🔒",
+            value=(
+                "`/ctf new ctftime:2401`\n"
+                "→ CTFtime 번호로 이름·일정·주소 자동 + 디스코드 이벤트 생성\n"
+                "`/ctf new name:대회이름 url:https://ctf.site token:토큰`\n"
+                "→ 직접 입력. 토큰까지 넣으면 **대회 시작 30초 뒤부터 문제 자동 수집** (최대 3번)\n"
+                "`/ctf new ctftime:2401 private:true`\n"
+                "→ 비공개 대회 (공지·참가버튼 없음, invite로만 참여)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="👥 참가하기",
+            value=(
+                "공개 대회 → `ctf-notice` 공지의 **[참가할게]** 버튼\n"
+                "`/ctf invite` 🔒 → 드롭다운에서 여러 명 골라 한 번에 초대\n"
+                "`/ctf kick` 🔒 → 참가자 중 골라서 내보내기"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="📥 문제 불러오기",
+            value=(
+                "`/ctf import url:https://ctf.site token:토큰` 🔒\n"
+                "→ 처음 한 번 전체 불러오기\n"
+                "`/ctf pull` → 새로 나온 문제만 추가 (누구나)\n"
+                "`/ctf creds token:새토큰` 🔒 → 토큰 저장·변경 (저장하면 바로 연결 확인)\n"
+                "`/ctf creds check:True` 🔒 → 지금 저장된 주소·토큰이 실제로 되는지 확인\n"
+                "지원: CTFd · rCTF · noCTF · GZCTF (GZCTF는 `…/games/번호` 주소)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🧩 풀이",
+            value=(
+                "`/ctf joinall` → 모든 문제 스레드에 한 번에 참여\n"
+                "`/ctf solve` → 풀이 등록, #solves 에 알림 (스레드당 1번)\n"
+                "`/ctf solve with:@철수 @영희` → 같이 푼 사람 함께 (@ 치고 골라)\n"
+                "`/ctf unsolve` → 잘못 등록했을 때 취소"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="✏️ 문제 관리",
+            value=(
+                "`/ctf createchallenge category:web name:문제이름` → 수동 추가\n"
+                "`/ctf deletechallenge` → (스레드 안) 이 문제 삭제, 기록은 백업\n"
+                "`/ctf button name:문제이름` → 지워진 참가 버튼 다시 올리기\n"
+                "`/ctf alias add from:binary to:pwn` → 분야 이름 묶기"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="📊 확인",
+            value=(
+                "`/ctf challenges` → 문제 목록 (`category:web` 로 분야만)\n"
+                "`/ctf scoreboard` → 누가 몇 개 풀었나\n"
+                "`/ctf upcoming days:7` → 7일 안에 시작하는 CTFtime 대회"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="⚙️ 운영 🔒",
+            value=(
+                "`/ctf schedule ends:2026-10-20 21:00` → 일정 변경 (공지도 같이 수정)\n"
+                "`/ctf archive` → 스레드 접어 정리 (종료 3일 뒤엔 자동)\n"
+                "`/ctf delete name:대회이름` → 대회 통째 삭제 (삭제 전 백업)"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="자동 수집이 실패하면 /ctf pull · 이 안내는 나에게만 보여")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @group.command(name="upcoming", description="CTFtime 진행중·예정 대회를 보여줄게")
+    @app_commands.describe(
+        days="지금 시간 기준으로 며칠 이내 시작하는 대회를 불러와. 예) 오늘 수요일에 7 넣으면 다음 주 수요일까지",
+    )
+    async def upcoming(
+        self, interaction: discord.Interaction, days: int | None = None
+    ) -> None:
         # 예정 대회는 팀 모두가 보게 공개로 답한다 (본인만 보이는 ephemeral 아님).
         await interaction.response.defer()
 
         try:
-            events = await ctftime_api.fetch_upcoming(limit)
+            if days is not None:
+                events = await ctftime_api.fetch_upcoming(within_days=days)
+            else:
+                events = await ctftime_api.fetch_upcoming()
         except ctftime_api.CTFtimeError as exc:
             await interaction.followup.send(f"⚠️ {exc}")
             return
 
         if not events:
-            await interaction.followup.send("다가오는 CTF가 없어.")
+            span = f"앞으로 {days}일 안에" if days else "다가오는"
+            await interaction.followup.send(f"{span} 열리는 CTF가 없어.")
             return
 
-        lines = ["🆕 **다가오는 CTF**"]
-        for event in events:
-            when = discord.utils.format_dt(event["start"], "R") if event["start"] else "?"
+        header = (
+            f"🗓️ **진행중 · {days}일 내 시작 CTF**" if days else "🗓️ **진행중 · 다가오는 CTF**"
+        )
+        lines = [header]
+        chars = len(header)
+        for i, event in enumerate(events):
+            if event.get("running"):
+                mark = "🔴"
+                when = (
+                    f"{discord.utils.format_dt(event['finish'], 'R')} 종료"
+                    if event["finish"]
+                    else "진행중"
+                )
+            else:
+                mark = "🆕"
+                when = discord.utils.format_dt(event["start"], "R") if event["start"] else "?"
             where = "온사이트" if event["onsite"] else "온라인"
             detail = f"{where} {event['format']}".strip()
             weight = f" · weight {event['weight']:.0f}" if event["weight"] else ""
-            lines.append(
-                f"`{event['id']}` **{event['title']}** — {when} · {detail}{weight}"
-            )
-        lines.append("\n만들려면 `/ctf new ctftime:<번호>` 로 번호를 넣어줘.")
+            main = f"`{event['id']}` {mark} **{event['title']}** — {when} · {detail}{weight}"
+
+            # 사이트 링크 + CTFtime 링크. <> 로 감싸 미리보기 카드는 숨긴다.
+            link_parts = []
+            if event["url"]:
+                link_parts.append(f"🔗 <{event['url']}>")
+            link_parts.append(f"CTFtime <https://ctftime.org/event/{event['id']}>")
+            link = "　" + " · ".join(link_parts)
+
+            # 디스코드 2000자 제한. 넘기 전에 멈추고 남은 개수를 알린다.
+            if chars + len(main) + len(link) + 2 > 1900:
+                lines.append(f"…외 {len(events) - i}개 더 (기간·개수를 좁혀봐)")
+                break
+            lines.append(main)
+            lines.append(link)
+            chars += len(main) + len(link) + 2
+
         await interaction.followup.send("\n".join(lines))
 
     @group.command(name="import", description="저장된 정보로 문제를 불러올게 (토큰 저장은 /ctf creds)")
@@ -419,7 +829,7 @@ class CTF(commands.Cog):
         ]
     )
     @app_commands.autocomplete(name=_any_ctf_autocomplete)
-    @app_commands.checks.has_permissions(manage_channels=True)
+    @lead_only()
     async def import_(
         self,
         interaction: discord.Interaction,
@@ -473,14 +883,16 @@ class CTF(commands.Cog):
                 progress=_progress_reporter(interaction),
             )
         except platforms.PlatformError as exc:
-            await interaction.followup.send(f"불러오지 못했어: {exc}", ephemeral=True)
+            # "⏳ 받는 중…" 진행 메시지를 그대로 두지 않고 결과로 바꿔 쓴다.
+            await _finish_progress(interaction, f"⚠️ 불러오지 못했어: {exc}")
             return
 
         # 연결정보 저장(덮어쓰기)은 하지 않는다 — 저장은 /ctf creds 로만 한다.
-        await interaction.followup.send(result.summary(), ephemeral=True)
+        # 진행 메시지(⏳)를 최종 요약으로 바꿔 완료 표시한다.
+        mark = "✅" if result.complete else "⚠️"
+        await _finish_progress(interaction, f"{mark} {result.summary()}")
 
     @group.command(name="pull", description="새로 추가된 문제만 가져올게")
-    @app_commands.checks.has_permissions(manage_channels=True)
     async def pull(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
 
@@ -506,10 +918,12 @@ class CTF(commands.Cog):
                 progress=_progress_reporter(interaction),
             )
         except platforms.PlatformError as exc:
-            await interaction.followup.send(f"불러오지 못했어: {exc}", ephemeral=True)
+            # "⏳ 받는 중…" 진행 메시지를 그대로 두지 않고 결과로 바꿔 쓴다.
+            await _finish_progress(interaction, f"⚠️ 불러오지 못했어: {exc}")
             return
 
-        await interaction.followup.send(result.summary(), ephemeral=True)
+        mark = "✅" if result.complete else "⚠️"
+        await _finish_progress(interaction, f"{mark} {result.summary()}")
 
     @group.command(name="creds", description="대회 연결정보(주소·토큰·자동임포트) 확인·설정")
     @app_commands.describe(
@@ -518,6 +932,7 @@ class CTF(commands.Cog):
         url="설정할 대회 주소. GZCTF는 게임 주소 …/games/5",
         platform="플랫폼 (토큰과 함께 지정)",
         clear="저장된 토큰을 지울래?",
+        check="저장된 주소·토큰이 실제로 되는지 지금 확인할래? (대회 서버에 목록만 한 번 물어봐)",
     )
     @app_commands.choices(
         platform=[
@@ -529,7 +944,7 @@ class CTF(commands.Cog):
         ]
     )
     @app_commands.autocomplete(name=_any_ctf_autocomplete)
-    @app_commands.checks.has_permissions(manage_channels=True)
+    @lead_only()
     async def creds(
         self,
         interaction: discord.Interaction,
@@ -538,6 +953,7 @@ class CTF(commands.Cog):
         url: str | None = None,
         platform: str | None = None,
         clear: bool = False,
+        check: bool = False,
     ) -> None:
         # 토큰까지 그대로 보여주므로 반드시 본인만 보이게(ephemeral) 답한다.
         await interaction.response.defer(ephemeral=True)
@@ -577,6 +993,19 @@ class CTF(commands.Cog):
                 changed = "✅ 주소 저장했어."
         if changed:
             ctf = await db.get_ctf(ctf["id"])
+
+        # ---- 확인: 주소·토큰을 바꿨거나 check 를 켜면 대회 서버에 목록만 한 번 물어본다 ----
+        # (틀린 토큰이 저장된 채로 대회를 맞지 않게 — 오늘처럼 무효 토큰이 들어가는 걸 바로 잡는다)
+        verify = None
+        if (changed and not clear) or check:
+            if ctf["ctfd_url"] and ctf["api_token"]:
+                verify = await _verify_credentials(ctf)
+            elif check:
+                missing = [w for w, v in (("주소", ctf["ctfd_url"]), ("토큰", ctf["api_token"])) if not v]
+                verify = (
+                    f"⚠️ 확인할 수 없어 — {'·'.join(missing)}이(가) 저장 안 돼 있어. "
+                    "`/ctf creds url:… token:…` 으로 먼저 넣어줘."
+                )
 
         # ---- 상태 출력 ----
         status = "아카이브" if ctf["status"] == "archived" else "진행중"
@@ -621,11 +1050,13 @@ class CTF(commands.Cog):
             f"🔑 토큰: {token_disp}",
             f"⚙️ 자동 임포트: {auto}",
         ]
+        if verify:
+            lines.append(f"🔎 확인: {verify}")
         head = (changed + "\n\n") if changed else ""
         await interaction.followup.send(head + "\n".join(lines), ephemeral=True)
 
     @group.command(name="archive", description="대회를 지금 바로 정리할게 (스레드만 접음)")
-    @app_commands.checks.has_permissions(manage_channels=True)
+    @lead_only()
     async def archive(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
 
@@ -651,7 +1082,7 @@ class CTF(commands.Cog):
         ends="종료 시각 (예: 2026-08-02 21:00). 종료 3일 뒤 자동 아카이브",
         clear="일정을 지울래? (자동 아카이브도 꺼짐)",
     )
-    @app_commands.checks.has_permissions(manage_channels=True)
+    @lead_only()
     async def schedule(
         self,
         interaction: discord.Interaction,
@@ -718,7 +1149,7 @@ class CTF(commands.Cog):
     @group.command(name="delete", description="대회를 통째로 삭제할게 (채널/역할/기록 전부)")
     @app_commands.describe(name="삭제할 대회 이름")
     @app_commands.autocomplete(name=_any_ctf_autocomplete)
-    @app_commands.checks.has_permissions(manage_channels=True)
+    @lead_only()
     async def delete(self, interaction: discord.Interaction, name: str) -> None:
         await interaction.response.defer(ephemeral=True)
 
@@ -806,7 +1237,6 @@ class CTF(commands.Cog):
     @group.command(name="createchallenge", description="새 문제를 추가할게")
     @app_commands.describe(category="문제 분류 (목록에서 고르거나 직접 입력)", name="문제 이름")
     @app_commands.autocomplete(category=_category_autocomplete)
-    @app_commands.checks.has_permissions(manage_channels=True)
     async def createchallenge(
         self, interaction: discord.Interaction, category: str, name: str
     ) -> None:
@@ -834,10 +1264,97 @@ class CTF(commands.Cog):
         except discord.HTTPException:
             pass
 
+    @group.command(name="button", description="문제 참가 버튼을 다시 올릴게 (실수로 지웠을 때)")
+    @app_commands.describe(name="버튼을 다시 만들 문제")
+    @app_commands.autocomplete(name=_challenge_autocomplete)
+    async def button(self, interaction: discord.Interaction, name: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        ctf = await _resolve_ctf(interaction)
+        if ctf is None:
+            await interaction.followup.send("대회 카테고리 안에서 실행해줘.", ephemeral=True)
+            return
+
+        # 이름이 같은 문제가 여러 개일 수 있어(분야가 다르거나 중복 등록) 전부 처리한다.
+        matches = await db.find_challenges_by_name(ctf["id"], name)
+        if not matches:
+            await interaction.followup.send(f"`{name}` 문제가 없어.", ephemeral=True)
+            return
+
+        # 기존 스레드를 가리키는 참가 버튼만 다시 올린다 — 스레드·내용은 그대로 둔다.
+        posted = []
+        for challenge in matches:
+            channel = interaction.guild.get_channel(challenge["channel_id"])
+            thread = interaction.guild.get_channel_or_thread(challenge["thread_id"])
+            if channel is None or thread is None:
+                continue
+            await channel.send(
+                f"**{challenge['name']}**",
+                view=views.challenge_view(challenge["thread_id"]),
+            )
+            posted.append(thread.mention)
+
+        if not posted:
+            await interaction.followup.send(
+                "문제 채널이나 스레드를 못 찾았어 (지워졌을 수 있어).", ephemeral=True
+            )
+        elif len(posted) > 1:
+            await interaction.followup.send(
+                f"이름이 같은 문제가 {len(posted)}개라 전부 버튼을 다시 올렸어: "
+                + ", ".join(posted),
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"{posted[0]} 참가 버튼 다시 올렸어.", ephemeral=True
+            )
+
+    @group.command(name="joinall", description="이 대회의 모든 문제 스레드에 한 번에 참여할게")
+    async def joinall(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        ctf = await _resolve_ctf(interaction)
+        if ctf is None:
+            await interaction.followup.send("대회 카테고리 안에서 실행해줘.", ephemeral=True)
+            return
+
+        challenges = await db.list_challenges(ctf["id"])
+        if not challenges:
+            await interaction.followup.send("아직 문제가 없어.", ephemeral=True)
+            return
+
+        joined = missing = 0
+        for i, ch in enumerate(challenges):
+            thread = interaction.guild.get_channel_or_thread(ch["thread_id"])
+            if not isinstance(thread, discord.Thread):
+                missing += 1
+                continue
+            try:
+                await thread.add_user(interaction.user)
+                joined += 1
+            except discord.HTTPException:
+                missing += 1
+            # 진행률 갱신 + 디스코드 레이트리밋 완화용 간격
+            if i and i % 10 == 0:
+                try:
+                    await interaction.edit_original_response(
+                        content=f"⏳ 참여 중… {joined}/{len(challenges)}"
+                    )
+                except discord.HTTPException:
+                    pass
+            await asyncio.sleep(0.25)
+
+        message = f"✅ **{joined}개** 문제 스레드에 참여했어."
+        if missing:
+            message += f" ({missing}개는 스레드를 못 찾음)"
+        try:
+            await interaction.edit_original_response(content=message)
+        except discord.HTTPException:
+            await interaction.followup.send(message, ephemeral=True)
+
     @group.command(name="deletechallenge", description="필요 없는 문제는 치워줄게")
     @app_commands.describe(name="지울 문제 (안 적으면 지금 있는 스레드의 문제)")
     @app_commands.autocomplete(name=_challenge_autocomplete)
-    @app_commands.checks.has_permissions(manage_channels=True)
     async def deletechallenge(
         self, interaction: discord.Interaction, name: str | None = None
     ) -> None:
@@ -918,9 +1435,8 @@ class CTF(commands.Cog):
             )
 
     @group.command(name="solve", description="풀었어? 그럼 등록해")
-    @app_commands.describe(with_="같이 푼 사람 (여러 명 가능)")
+    @app_commands.describe(with_="같이 푼 사람 — @멘션으로 여러 명 (@철수 @영희). @ 치고 골라")
     @app_commands.rename(with_="with")
-    @app_commands.autocomplete(with_=_member_autocomplete)
     async def solve(
         self, interaction: discord.Interaction, with_: str | None = None
     ) -> None:
@@ -940,23 +1456,31 @@ class CTF(commands.Cog):
 
         ctf = await db.get_ctf(challenge["ctf_id"])
 
+        # 원자적 게이트: 스레드당 solve 는 딱 한 번. 여러 번·동시에 눌러도 첫 호출만
+        # 통과한다. 이미 풀렸으면 '이미 솔브됨'만 알리고 끝 (unsolve 하면 다시 열림).
+        if not await db.claim_solve(challenge["id"]):
+            # 누가 등록했는지 알려준다 (스레드 이름 ✅ 는 디스코드 제한으로 늦게 바뀔 수 있어서
+            # 화면만 보면 "안 풀렸는데 왜?" 가 된다). 멘션 알림은 안 가게 이름만 보여준다.
+            solvers = await db.solvers_of(challenge["id"])
+            who = f" — <@{solvers[0]['user_id']}> 이(가) 등록했어" if solvers else ""
+            await interaction.followup.send(
+                f"이미 솔브된 문제야{who}.\n"
+                "잘못 등록된 거면 `/ctf unsolve` 한 뒤 다시 해줘.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        # 처음 푼 경우에만 풀이자 기록 + 스레드 ✅ + #solves 공지.
         await db.add_solve(challenge["id"], interaction.user.id)
         for uid in contributor_ids:
             await db.add_solve(challenge["id"], uid)
 
-        thread = interaction.channel
-        if isinstance(thread, discord.Thread):
-            new_name = structure.thread_name(challenge["name"], solved=True)
-            if thread.name != new_name:
-                await thread.edit(name=new_name)
-
-        # solves 알림 메시지 ID 를 기억해뒀다가, unsolve 하면 그 알림을 지운다.
+        # #solves 공지를 올리고 그 알림 ID 를 저장한다 (unsolve 하면 그 알림을 지운다).
+        # 스레드 이름(✅)보다 먼저 한다 — 이름 변경은 디스코드 제한으로 몇 분 밀릴 수 있다.
         solve_message_id = None
         category = interaction.guild.get_channel(ctf["category_id"])
         if category is not None:
-            # 이미 풀린 상태에서 다시 호출하면(협력자 추가 등) 이전 알림을 지우고 새로 올린다.
-            if challenge["solved"] and challenge["solve_message_id"]:
-                await structure.delete_in(category, "solves", challenge["solve_message_id"])
             msg = await structure.post_to(
                 category,
                 "solves",
@@ -968,10 +1492,22 @@ class CTF(commands.Cog):
                 ),
             )
             solve_message_id = msg.id if msg else None
+        await db.set_solve_message(challenge["id"], solve_message_id)
 
-        await db.mark_solved(challenge["id"], None, solve_message_id)
-
-        # 결과는 스레드 이름(✅)과 #solves 알림으로 이미 보이므로 확인 메시지는 생략한다.
+        # 스레드 이름 ✅ 는 뒤에서 맞춘다 (기다리지 않는다). 제한 때문에 늦어질 상황이면 안내한다.
+        delayed = False
+        thread = interaction.channel
+        if isinstance(thread, discord.Thread):
+            delayed = structure.sync_thread_name(
+                thread, challenge["id"], structure.thread_name(challenge["name"], solved=True)
+            )
+        if delayed:
+            posted = " #solves 에도 올렸어." if solve_message_id else ""
+            await interaction.followup.send(
+                f"✅ 솔브 등록했어.{posted}{structure.RENAME_DELAY_NOTE}", ephemeral=True
+            )
+            return
+        # 결과는 #solves 알림과 스레드 이름(✅)으로 보이므로 확인 메시지는 생략한다.
         try:
             await interaction.delete_original_response()
         except discord.HTTPException:
@@ -1002,14 +1538,18 @@ class CTF(commands.Cog):
 
         await db.mark_unsolved(challenge["id"])
 
+        # 스레드 이름 ❌ 는 뒤에서 맞춘다 (명령이 디스코드 이름 변경 제한을 기다리지 않게).
+        delayed = False
         thread = interaction.channel
         if isinstance(thread, discord.Thread):
-            new_name = structure.thread_name(challenge["name"], solved=False)
-            if thread.name != new_name:
-                await thread.edit(name=new_name)
+            delayed = structure.sync_thread_name(
+                thread, challenge["id"], structure.thread_name(challenge["name"], solved=False)
+            )
 
         solved, total = await db.solve_counts(ctf["id"])
         note = "" if removed else "\n(`#solves` 알림은 못 찾아서 그대로야)"
+        if delayed:
+            note += structure.RENAME_DELAY_NOTE
         await interaction.followup.send(
             f"**{challenge['name']}** 풀이를 취소했어. ({solved}/{total} solved){note}",
             ephemeral=True,
@@ -1062,7 +1602,6 @@ class CTF(commands.Cog):
     )
     @app_commands.rename(from_="from")
     @app_commands.autocomplete(from_=_seen_autocomplete, to=_category_autocomplete)
-    @app_commands.checks.has_permissions(manage_channels=True)
     async def alias_add(
         self, interaction: discord.Interaction, from_: str, to: str
     ) -> None:
@@ -1090,7 +1629,6 @@ class CTF(commands.Cog):
     @app_commands.describe(from_="지울 별칭 (이 서버에서 추가한 것만)")
     @app_commands.rename(from_="from")
     @app_commands.autocomplete(from_=_alias_autocomplete)
-    @app_commands.checks.has_permissions(manage_channels=True)
     async def alias_remove(self, interaction: discord.Interaction, from_: str) -> None:
         saved = await db.alias_map(interaction.guild_id)
         slug = structure.channel_name(from_)
@@ -1239,19 +1777,31 @@ class CTF(commands.Cog):
 
         if isinstance(error, app_commands.MissingPermissions):
             message = "이 명령어를 쓸 권한이 없어."
+        elif isinstance(error, app_commands.CheckFailure):
+            # lead_only()·MissingRole 등 체크 실패. 메시지가 있으면 그대로 보여준다.
+            message = str(error) or "이 명령어를 쓸 권한이 없어."
         elif isinstance(original, discord.Forbidden):
             message = (
                 "봇 권한이 부족해. 채널/역할/스레드 관리 권한을 확인해줘.\n"
                 "역할 부여가 안 되면 봇 역할이 대회 역할보다 위에 있는지도 봐줘."
             )
+        elif isinstance(original, TimeoutError):
+            # 대회 서버·디스코드가 느려서 시간 초과. 예전엔 메시지가 빈 채로 "문제가 생겼어:" 만 떴다.
+            log.warning("명령어 시간 초과: %s", interaction.command and interaction.command.qualified_name)
+            message = "응답이 너무 늦어서 시간 초과됐어 (대회 서버가 느리거나 터진 상태일 수 있어). 잠시 뒤 다시 해줘."
         else:
             log.exception("명령어 오류", exc_info=error)
-            message = f"문제가 생겼어: {original}"
+            # 예외 메시지가 비어 있으면 최소한 종류라도 보여준다.
+            message = f"문제가 생겼어: {str(original) or type(original).__name__}"
 
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+        # 응답 창이 이미 닫혔으면(15분 초과 등) 보내기도 실패한다 — 로그만 남기고 넘어간다.
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            log.warning("오류 안내를 못 보냄: %s", message)
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
@@ -93,25 +93,51 @@ async def fetch_event(event_id: int) -> dict:
     return _clean(data)
 
 
-async def fetch_upcoming(limit: int = 5) -> list[dict]:
-    """다가오는 대회들 (시작 빠른 순). 10분 캐시. limit 은 1~10 으로 제한."""
-    limit = max(1, min(limit, 10))
+async def fetch_upcoming(limit: int = 5, within_days: int | None = None) -> list[dict]:
+    """진행중 + 다가오는 대회들. 진행중 먼저, 그다음 시작 빠른 순. 10분 캐시.
+
+    CTFtime 이벤트 API 는 '시작 시각이 조회창 안'인 것만 주므로, 이미 시작한
+    (진행중) 대회를 놓치지 않으려고 창을 뒤로 7일 넓혀 가져온 뒤 아직 안 끝난
+    것만 남긴다. 각 이벤트에 running(진행중 여부) 플래그를 붙인다.
+
+    within_days 를 주면 개수(limit) 대신 '진행중 + 앞으로 그 기간 내 시작' 대회를
+    전부 돌려준다 (안전상 최대 25개).
+    """
+    limit = max(1, min(limit, 15))
     now = time.time()
 
     if _cache["events"] is None or now - _cache["at"] > _CACHE_TTL:
-        start = int(now)
-        finish = start + 60 * 60 * 24 * 90  # 앞으로 90일 창
+        start = int(now) - 60 * 60 * 24 * 7    # 진행중 대회를 포함하려고 뒤로 7일
+        finish = int(now) + 60 * 60 * 24 * 90  # 앞으로 90일
         async with aiohttp.ClientSession() as session:
             data = await _get(
                 session,
                 f"{API}/events/",
-                params={"limit": "50", "start": str(start), "finish": str(finish)},
+                params={"limit": "100", "start": str(start), "finish": str(finish)},
             )
-        events = [_clean(e) for e in data if isinstance(e, dict)]
+        now_dt = datetime.now(timezone.utc)
         far_future = datetime.max.replace(tzinfo=timezone.utc)
-        events.sort(key=lambda e: e["start"] or far_future)
+        events = []
+        for raw in data:
+            if not isinstance(raw, dict):
+                continue
+            event = _clean(raw)
+            if not event["finish"] or event["finish"] < now_dt:
+                continue  # 이미 끝난 대회는 뺀다
+            event["running"] = bool(event["start"] and event["start"] <= now_dt)
+            events.append(event)
+        # 진행중을 위로, 그다음 시작 임박 순.
+        events.sort(key=lambda e: (not e["running"], e["start"] or far_future))
         _cache["events"] = events
         _cache["at"] = now
-        log.info("CTFtime 예정 대회 %d개 갱신", len(events))
+        log.info("CTFtime 진행중/예정 대회 %d개 갱신", len(events))
 
-    return _cache["events"][:limit]
+    events = _cache["events"]
+    if within_days is not None:
+        cutoff = datetime.now(timezone.utc) + timedelta(days=max(1, within_days))
+        events = [
+            e for e in events
+            if e.get("running") or (e["start"] and e["start"] <= cutoff)
+        ]
+        return events[:25]
+    return events[:limit]

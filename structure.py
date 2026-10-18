@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 from datetime import datetime
 
 import discord
@@ -134,6 +136,69 @@ def thread_name(name: str, solved: bool) -> str:
     return f"{SOLVED if solved else UNSOLVED} {name}"[:100]
 
 
+# ---------- 스레드 이름(✅/❌) 맞추기 ----------
+# 디스코드는 채널·스레드 이름 변경을 '채널마다 10분에 2번'으로 막는다 (디스코드 API 제한).
+# 예전엔 solve/unsolve 가 이름 바꾸기를 기다리느라 최대 10분 멈췄고, 그사이 쌓인 명령들이
+# 늦게 한꺼번에 풀리면서 솔브 알림이 중복되고 ✅/❌ 가 실제 상태와 어긋났다.
+# 이제 이름은 뒤에서 따로 바꾸고, 바꿀 때마다 '그 순간의 실제 상태(DB)'에 맞춘다.
+RENAME_LIMIT = 2
+RENAME_WINDOW = 600.0
+RENAME_DELAY_NOTE = "\n(스레드 이름은 디스코드 제한 — 이름 변경 10분에 2번 — 때문에 몇 분 뒤에 바뀌어)"
+_rename_times: dict[int, list[float]] = {}
+_rename_tasks: dict[int, asyncio.Task] = {}
+
+
+def _rename_wait(thread_id: int) -> float:
+    """지금 이름을 바꾸면 제한에 걸리는지. 걸리면 풀릴 때까지 남은 초, 아니면 0."""
+    now = time.monotonic()
+    recent = [t for t in _rename_times.get(thread_id, []) if now - t < RENAME_WINDOW]
+    _rename_times[thread_id] = recent
+    if len(recent) < RENAME_LIMIT:
+        return 0.0
+    return recent[-RENAME_LIMIT] + RENAME_WINDOW - now + 1.0
+
+
+def sync_thread_name(thread: discord.Thread, challenge_id: int, expected: str) -> bool:
+    """스레드 이름을 실제 풀이 상태에 맞추는 작업을 뒤에서 건다 (명령은 기다리지 않는다).
+
+    같은 스레드에 이미 걸린 작업이 있으면 새로 만들지 않는다 — 그 작업이 이름을 바꾸기
+    직전에 DB 를 다시 읽으므로 최신 상태로 맞춰진다. 이름 변경이 디스코드 제한으로
+    미뤄질 상황이면 True (호출한 쪽이 "몇 분 뒤 바뀌어" 라고 안내할 수 있게).
+    """
+    pending = _rename_tasks.get(thread.id)
+    busy = pending is not None and not pending.done()
+    if not busy:
+        _rename_tasks[thread.id] = asyncio.create_task(_sync_thread_name(thread, challenge_id))
+    return thread.name != expected and (busy or _rename_wait(thread.id) > 0)
+
+
+async def _sync_thread_name(thread: discord.Thread, challenge_id: int) -> None:
+    thread_id = thread.id
+    try:
+        # 바꾸는 사이 상태가 또 바뀌었으면 다시 맞춘다 — 최대 3번 (무한 반복 없음).
+        for _ in range(3):
+            # 제한에 걸려 있으면 풀릴 때까지 먼저 기다리고, 그다음에 상태를 읽는다.
+            # (상태를 먼저 읽고 기다리면, 기다리는 사이 unsolve 해도 낡은 이름으로 바뀐다.)
+            wait = _rename_wait(thread_id)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            row = await db.get_challenge_by_thread(thread_id)
+            if row is None or row["id"] != challenge_id:
+                return
+            want = thread_name(row["name"], solved=bool(row["solved"]))
+            if thread.name == want:
+                return
+            thread = await thread.edit(name=want)
+            _rename_times.setdefault(thread_id, []).append(time.monotonic())
+    except discord.HTTPException as exc:
+        log.warning("스레드 이름 변경 실패 (%s): %s", thread_id, exc)
+    except Exception:
+        log.exception("스레드 이름 맞추기 오류 (%s)", thread_id)
+    finally:
+        if _rename_tasks.get(thread_id) is asyncio.current_task():
+            del _rename_tasks[thread_id]
+
+
 async def create_ctf(
     guild: discord.Guild,
     name: str,
@@ -237,7 +302,7 @@ async def create_challenge_thread(
         # "비공개 스레드 만들기" 권한이 없으면 공개 스레드로 물러난다.
         log.warning(
             "비공개 스레드 권한이 없어 공개 스레드로 만듭니다. "
-            "서버 설정 > 역할 > 노비스 에서 '비공개 스레드 만들기' 를 켜주세요."
+            "서버 설정 > 역할 > (봇 역할) 에서 '비공개 스레드 만들기' 를 켜주세요."
         )
         thread = await channel.create_thread(
             name=thread_name(name, solved=False),

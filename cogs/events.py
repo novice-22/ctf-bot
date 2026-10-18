@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -30,8 +31,13 @@ from cogs.ctf import ARCHIVE_GRACE
 
 log = logging.getLogger("ctfbot.events")
 
-# 대회가 시작 정각에 문제를 열지 않는 경우가 흔해서, 이만큼 기다렸다 가져온다.
-IMPORT_DELAY = timedelta(minutes=1)
+# 대회 시작 후 이 시점들에 문제를 가져온다. 성공하면 남은 시도는 건너뛴다.
+# (시작 정각엔 문제를 안 여는 대회가 많아 30초 뒤부터, 최대 3번)
+IMPORT_SCHEDULE = (timedelta(seconds=30), timedelta(seconds=60), timedelta(minutes=2))
+# 루프가 1분 주기라, 이만큼 앞서 시작하는 대회는 미리 예약해 둔다.
+IMPORT_LOOKAHEAD = timedelta(minutes=1)
+# 자동 임포트 실패 같은 운영 알림을 DM 으로 받을 사람. 비우면 서버장.
+ALERT_USER_ID = int(os.getenv("ALERT_USER_ID") or 0)
 
 # 이벤트 설명에 `token: xxx` 로 적어두면 읽어서 저장하고 그 줄을 지운다.
 TOKEN_RE = re.compile(r"^\s*token\s*[:=]\s*(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
@@ -40,12 +46,18 @@ TOKEN_RE = re.compile(r"^\s*token\s*[:=]\s*(\S+)\s*$", re.IGNORECASE | re.MULTIL
 class Events(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        # 대회별 자동 임포트 예약 작업 (중복 예약 방지, 메모리에만 둔다)
+        self._import_tasks: dict[int, asyncio.Task] = {}
+        # 봇이 켜진 뒤 첫 주기에 스레드 이름(✅/❌)을 실제 상태와 한 번 맞춘다.
+        self._names_checked = False
 
     async def cog_load(self) -> None:
         self.check_archive.start()
 
     async def cog_unload(self) -> None:
         self.check_archive.cancel()
+        for task in self._import_tasks.values():
+            task.cancel()
 
     # ---------- 이벤트 → 대회 ----------
 
@@ -208,6 +220,13 @@ class Events(commands.Cog):
             log.exception("정기 작업 중 오류 — 다음 분에 계속합니다")
 
     async def _tick(self) -> None:
+        if not self._names_checked:
+            self._names_checked = True
+            try:
+                await self._reconcile_thread_names()
+            except Exception:
+                log.exception("스레드 이름 맞추기 실패")
+
         for kind in ("start", "end"):
             for ctf in await db.ctfs_due_for_announce(kind):
                 try:
@@ -219,13 +238,15 @@ class Events(commands.Cog):
                     # 한 번 놓치는 편이 낫다.
                     await db.mark_announced(ctf["id"], kind)
 
-        for ctf in await db.ctfs_due_for_auto_import(IMPORT_DELAY):
-            try:
-                await self._auto_import(ctf)
-            except Exception:
-                log.exception("대회 %s 자동 임포트 실패", ctf["name"])
-            finally:
-                await db.mark_auto_imported(ctf["id"])
+        # 곧 시작하거나 이미 시작한 대회는 +30초·+60초·+2분 시도를 예약한다.
+        # (지연을 음수로 주면 '앞으로 1분 안에 시작하는 대회'까지 잡힌다.)
+        for ctf in await db.ctfs_due_for_auto_import(-IMPORT_LOOKAHEAD):
+            task = self._import_tasks.get(ctf["id"])
+            if task is not None and not task.done():
+                continue  # 이미 예약돼 돌고 있음
+            self._import_tasks[ctf["id"]] = asyncio.create_task(
+                self._run_import_schedule(ctf["id"]), name=f"auto-import-{ctf['id']}"
+            )
 
         for ctf in await db.ctfs_due_for_archive(ARCHIVE_GRACE):
             try:
@@ -305,18 +326,91 @@ class Events(commands.Cog):
 
         return "\n".join(lines)
 
-    async def _auto_import(self, ctf) -> None:
-        """대회가 시작하고 조금 지난 뒤 문제를 한 번 가져온다.
+    async def _reconcile_thread_names(self) -> None:
+        """봇이 꺼지거나 재시작되는 사이 어긋난 스레드 이름(✅/❌)을 실제 상태에 맞춘다.
 
-        결과는 bot-cmd 에 남긴다. 실패해도 다시 시도하지 않고, 사람이 `/ctf pull`
-        로 이어가면 된다 (1분마다 같은 오류를 반복하는 편이 더 나쁘다).
+        진행 중인 대회의, 지금 열려 있는(캐시에 있는) 스레드만 본다. 이름이 이미 맞으면 손대지
+        않으므로 디스코드 이름 변경 제한(10분에 2번)을 헛되이 쓰지 않는다. 한 번만 돈다.
+        """
+        fixed = 0
+        for guild in self.bot.guilds:
+            for ctf in await db.list_all_ctfs(guild.id):
+                if ctf["status"] != "active":
+                    continue
+                for ch in await db.list_challenges(ctf["id"]):
+                    thread = guild.get_channel_or_thread(ch["thread_id"])
+                    if not isinstance(thread, discord.Thread):
+                        continue
+                    want = structure.thread_name(ch["name"], solved=bool(ch["solved"]))
+                    if thread.name != want:
+                        structure.sync_thread_name(thread, ch["id"], want)
+                        fixed += 1
+        if fixed:
+            log.info("스레드 이름 %d개를 실제 풀이 상태에 맞추는 중", fixed)
+
+    async def _run_import_schedule(self, ctf_id: int) -> None:
+        """대회 시작 +30초 · +60초 · +2분에 문제를 가져온다. 성공하면 남은 시도는 안 한다.
+
+        봇이 늦게 켜져 시점이 이미 다 지났으면 한 번만 바로 시도한다 (연달아 두드리지 않게).
+        모두 실패하면 대회 채널이 아니라 서버장(또는 ALERT_USER_ID)에게만 DM 으로 알린다.
+        """
+        try:
+            ctf = await db.get_ctf(ctf_id)
+            if ctf is None or not ctf["starts_at"]:
+                return
+            start = datetime.fromisoformat(ctf["starts_at"])
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            times = [start + d for d in IMPORT_SCHEDULE if start + d >= now - timedelta(seconds=5)]
+            if not times:
+                times = [now]
+
+            error = None
+            for i, when in enumerate(times, 1):
+                delay = (when - datetime.now(timezone.utc)).total_seconds()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                # 기다리는 사이 수동 pull · 토큰 변경 · 대회 삭제가 있었을 수 있어 다시 읽는다.
+                ctf = await db.get_ctf(ctf_id)
+                if ctf is None or ctf["auto_imported"]:
+                    return
+                ok, error = await self._auto_import(ctf)
+                if ok:
+                    await db.mark_auto_imported(ctf_id)
+                    return
+                log.info("%s 자동 임포트 %d/%d회 실패: %s", ctf["name"], i, len(times), error)
+
+            await db.mark_auto_imported(ctf_id)
+            await self._notify_owner(
+                ctf,
+                f"⚠️ **{ctf['name']}** 문제를 자동으로 못 불러왔어 ({len(times)}번 시도).\n"
+                f"{(error or '')[:1500]}\n"
+                f"대회 카테고리에서 `/ctf pull` 로 다시 해줘.",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("대회 %s 자동 임포트 예약 실행 실패", ctf_id)
+            try:
+                await db.mark_auto_imported(ctf_id)  # 매분 같은 오류로 재예약되지 않게
+            except Exception:
+                pass
+        finally:
+            self._import_tasks.pop(ctf_id, None)
+
+    async def _auto_import(self, ctf) -> tuple[bool, str | None]:
+        """문제를 한 번 가져온다. (성공 여부, 실패 이유).
+
+        성공 결과만 대회의 bot-cmd 에 올린다. 실패는 여기서 알리지 않는다 —
+        재시도가 남았을 수 있고, 최종 실패는 _notify_owner 로 본인에게만 보낸다.
         """
         guild = self.bot.get_guild(ctf["guild_id"])
         if guild is None:
-            return
+            return False, "서버를 찾을 수 없어"
         category = guild.get_channel(ctf["category_id"])
         if category is None:
-            return
+            return False, "대회 카테고리를 찾을 수 없어"
 
         try:
             result = await importer.sync(
@@ -327,15 +421,38 @@ class Events(commands.Cog):
                 ctf["platform"] or "auto",
             )
         except platforms.PlatformError as exc:
-            log.warning("%s 자동 임포트 실패: %s", ctf["name"], exc)
-            await structure.post_to(
-                category,
-                "bot-cmd",
-                f"⚠️ 문제를 자동으로 못 불러왔어: {exc}\n`/ctf pull` 로 다시 시도해줘.",
-            )
-            return
+            return False, str(exc)
+        except Exception as exc:
+            log.exception("%s 자동 임포트 중 예상 못한 오류", ctf["name"])
+            return False, f"예상 못한 오류: {exc}"
 
-        await structure.post_to(category, "bot-cmd", f"📥 {result.summary()}")
+        # 팀 채널엔 성공한 부분만 올린다. 못 받은 문제 같은 실패 내용은 마지막에 본인 DM 으로만.
+        # 방금 누가 pull 한 결과를 재사용한 거면(cached_age) 팀 채널에 또 올리지 않는다.
+        if result.added and result.cached_age is None:
+            await structure.post_to(
+                category, "bot-cmd", f"📥 {result.summary(details=False)}"
+            )
+        if not result.complete:
+            # 서버가 느려 일부만 받았다 — 다음 예약 시도에서 남은 것만 이어서 받는다.
+            return False, "\n".join(result.problem_lines())
+        return True, None
+
+    async def _notify_owner(self, ctf, text: str) -> None:
+        """운영 알림(자동 임포트 실패 등)을 서버장에게만 DM 으로 보낸다.
+
+        대회 채널에 올리면 팀원·관리자 모두 보게 되므로 DM 을 쓴다.
+        ALERT_USER_ID 를 지정하면 서버장 대신 그 사람에게 보낸다. DM 이 막혀 있으면 로그만 남긴다.
+        """
+        guild = self.bot.get_guild(ctf["guild_id"])
+        uid = ALERT_USER_ID or (guild.owner_id if guild else 0)
+        if not uid:
+            log.warning("알림 받을 사람을 못 찾아 DM 을 건너뜁니다: %s", text[:100])
+            return
+        try:
+            user = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+            await user.send(text)
+        except discord.HTTPException as exc:
+            log.warning("알림 DM 실패 (%s): %s", uid, exc)
 
     async def _auto_archive(self, ctf) -> None:
         """종료 후 유예기간이 지난 대회의 스레드를 접는다. 채널은 절대 지우지 않는다."""

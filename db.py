@@ -207,6 +207,14 @@ async def set_ctf_end(ctf_id: int, ends_at: datetime | None) -> None:
     await conn().commit()
 
 
+async def set_ctf_event(ctf_id: int, event_id: int) -> None:
+    """대회에 디스코드 예약 이벤트를 연결한다 (이벤트 수정 → 일정 동기화용)."""
+    await conn().execute(
+        "UPDATE ctfs SET event_id = ? WHERE id = ?", (event_id, ctf_id)
+    )
+    await conn().commit()
+
+
 async def ctfs_due_for_announce(kind: str) -> list[aiosqlite.Row]:
     """시작/종료 시각이 된 대회들 중 아직 알리지 않은 것. kind 는 'start' 또는 'end'.
 
@@ -389,6 +397,12 @@ async def existing_ctfd_ids(ctf_id: int) -> set[int]:
     return {row[0] for row in await cur.fetchall()}
 
 
+async def existing_challenge_names(ctf_id: int) -> set[str]:
+    """대회에 이미 있는 문제 이름(소문자). 수동 생성 문제와 이름이 겹치는 임포트를 막는다."""
+    cur = await conn().execute("SELECT name FROM challenges WHERE ctf_id = ?", (ctf_id,))
+    return {(row[0] or "").strip().lower() for row in await cur.fetchall()}
+
+
 async def mark_solved(
     challenge_id: int, flag: str | None, solve_message_id: int | None = None
 ) -> None:
@@ -399,6 +413,29 @@ async def mark_solved(
                   solve_message_id = ?
             WHERE id = ?""",
         (flag, solve_message_id, challenge_id),
+    )
+    await conn().commit()
+
+
+async def claim_solve(challenge_id: int) -> bool:
+    """안 풀린 문제를 '풀림'으로 원자적으로 바꾼다.
+
+    이 호출이 0→1 로 바꿨으면 True(처음 푼 것), 이미 풀려 있었으면 False.
+    /ctf solve 를 여러 번(또는 동시에) 눌러도 알림이 딱 한 번만 올라가게 한다 —
+    단일 연결이 UPDATE 를 직렬화하므로 첫 호출만 rowcount 1 을 받는다.
+    """
+    cur = await conn().execute(
+        "UPDATE challenges SET solved = 1 WHERE id = ? AND solved = 0", (challenge_id,)
+    )
+    await conn().commit()
+    return cur.rowcount == 1
+
+
+async def set_solve_message(challenge_id: int, message_id: int | None) -> None:
+    """solves 알림 메시지 ID 를 저장한다 (나중에 unsolve 로 그 알림을 지울 때 쓴다)."""
+    await conn().execute(
+        "UPDATE challenges SET solve_message_id = ? WHERE id = ?",
+        (message_id, challenge_id),
     )
     await conn().commit()
 
