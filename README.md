@@ -34,7 +34,7 @@ CTF 대회가 열리면 **문제 목록이 디스코드에 자동으로 펼쳐�
 
 ## 기능
 
-- **문제 자동 불러오기** — CTFd · rCTF · noCTF · GZCTF 에서 문제 목록·설명·첨부파일을 가져와 분야별 채널 + 문제별 스레드로 만든다
+- **문제 자동 불러오기** — CTFd · rCTF · noCTF · GZCTF · Flugsicherung(Platypwn) 에서 문제 목록·설명·첨부파일을 가져와 분야별 채널 + 문제별 스레드로 만든다
 - **대회 시작 자동 수집** — 주소·토큰을 저장해두면 시작 30초·1분·2분 뒤 최대 3번 시도. 실패하면 운영자에게만 DM
 - **CTFtime 연동** — `/ctf upcoming` 으로 예정 대회 조회, 대회 번호만 주면 이름·일정·주소 자동 입력
 - **디스코드 이벤트 연동** — 서버 이벤트를 만들면 대회 구조 자동 생성 + 참가 공지
@@ -342,9 +342,36 @@ docker logs -f ctf-bot     # "로그인: 봇이름#1234" 확인 후 Ctrl+C (봇�
 | **rCTF** | 팀 로그인 링크 `…/login?token=XXX` 의 token 값 (링크를 통째로 붙여넣어도 됨) | 대회 사이트 주소 |
 | **noCTF** | 로그인한 브라우저의 Bearer 토큰 (F12 → Network 탭 → 아무 API 요청의 `Authorization: Bearer …` 값) | API 주소가 사이트와 다를 수 있다. F12 → Network 탭에서 `challenges` 요청이 가는 주소의 앞부분 |
 | **GZCTF** | 로그인한 브라우저의 `GZCTF_Token` 쿠키 값. 그 계정이 대회에 참가 승인돼 있어야 함 | 게임 주소 `https://…/games/5` |
+| **Flugsicherung** (Platypwn) | 로그인 토큰 `eyJ…` — **3분이면 만료**돼서 저장하지 말고 아래 방법으로 복사해 바로 `/ctf import token:` | 대회 사이트 주소 (API 주소는 봇이 알아서 찾음) |
 
 > **쿠키 값 복사하는 법**: 대회 사이트에서 F12 → **Application** 탭(파이어폭스는 Storage) → 왼쪽 **Cookies** → 사이트 주소 → 이름(`session`, `GZCTF_Token`) 옆의 Value 복사.
 > 자동으로 못 불러오는 대회(Cloudflare 보호 등)는 `/ctf createchallenge category:pwn name:문제이름` 으로 직접 만든다.
+
+<details>
+<summary><b>Flugsicherung(Platypwn) 토큰 복사하는 법</b> — 토큰이 쿠키·Storage 에 없고 메모리에만 있다</summary>
+
+1. 대회 사이트에서 F12 → **Console** 탭 → 아래를 붙여넣고 Enter (붙여넣기가 막히면 먼저 `allow pasting` 입력)
+   ```js
+   (() => {
+     const orig = window.fetch;
+     window.fetch = async (input, init = {}) => {
+       const h = new Headers(init.headers || (input instanceof Request ? input.headers : undefined));
+       const auth = h.get('authorization') || '';
+       if (auth.startsWith('Bearer ')) {
+         window.__tok = auth.slice(7);
+         window.fetch = orig;
+         console.log('토큰 잡음 → copy(__tok) 로 복사');
+       }
+       return orig(input, init);
+     };
+     console.log('준비됨 — 왼쪽 메뉴에서 아무 메뉴나 눌러줘');
+   })();
+   ```
+2. 왼쪽 메뉴(예: **Your team**)를 누른다 (새로고침 X)
+3. `copy(__tok)` 입력 → 클립보드에 복사됨 → **3분 안에** `/ctf import url:대회사이트주소 token:붙여넣기`
+4. 새 문제가 나오면 같은 방법으로 다시 import (이미 받은 문제는 건너뜀). `/ctf pull` 은 저장된 토큰이 만료돼서 안 된다.
+
+</details>
 
 ### 문제 풀었을 때
 

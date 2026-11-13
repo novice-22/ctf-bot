@@ -76,7 +76,13 @@ def _progress_reporter(interaction: discord.Interaction):
     return report
 
 
-PLATFORM_NAMES = {"ctfd": "CTFd", "rctf": "rCTF", "noctf": "noCTF", "gzctf": "GZCTF"}
+PLATFORM_NAMES = {
+    "ctfd": "CTFd",
+    "rctf": "rCTF",
+    "noctf": "noCTF",
+    "gzctf": "GZCTF",
+    "flugsicherung": "Flugsicherung",
+}
 
 
 async def _verify_credentials(ctf) -> str:
@@ -708,7 +714,7 @@ class CTF(commands.Cog):
                 "`/ctf import` 🔒 → 처음 한 번 전체 불러오기\n"
                 "`/ctf pull` → 새로 나온 문제만 추가 (누구나)\n"
                 "`/ctf creds check:True` 🔒 → 지금 저장된 주소·토큰이 실제로 되는지 확인\n"
-                "지원: CTFd · rCTF · noCTF · GZCTF (GZCTF는 `…/games/번호` 주소)"
+                "지원: CTFd · rCTF · noCTF · GZCTF (GZCTF는 `…/games/번호` 주소) · Flugsicherung"
             ),
             inline=False,
         )
@@ -829,6 +835,7 @@ class CTF(commands.Cog):
             app_commands.Choice(name="rCTF", value="rctf"),
             app_commands.Choice(name="noCTF", value="noctf"),
             app_commands.Choice(name="GZCTF", value="gzctf"),
+            app_commands.Choice(name="Flugsicherung (Platypwn)", value="flugsicherung"),
         ]
     )
     @app_commands.autocomplete(name=_any_ctf_autocomplete)
@@ -949,6 +956,7 @@ class CTF(commands.Cog):
             app_commands.Choice(name="rCTF", value="rctf"),
             app_commands.Choice(name="noCTF", value="noctf"),
             app_commands.Choice(name="GZCTF", value="gzctf"),
+            app_commands.Choice(name="Flugsicherung (Platypwn)", value="flugsicherung"),
         ]
     )
     @app_commands.autocomplete(name=_any_ctf_autocomplete)
@@ -1018,12 +1026,7 @@ class CTF(commands.Cog):
         # ---- 상태 출력 ----
         status = "아카이브" if ctf["status"] == "archived" else "진행중"
         url_disp = ctf["ctfd_url"] or "없음"
-        platform_disp = {
-            "ctfd": "CTFd",
-            "rctf": "rCTF",
-            "noctf": "noCTF",
-            "gzctf": "GZCTF",
-        }.get(ctf["platform"], "자동판별")
+        platform_disp = PLATFORM_NAMES.get(ctf["platform"], "자동판별")
         token_disp = f"`{ctf['api_token']}`" if ctf["api_token"] else "없음"
 
         starts = _stored_dt(ctf["starts_at"])

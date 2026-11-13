@@ -62,9 +62,9 @@ class PlatformRejected(PlatformError):
 
 
 def _server_message(payload) -> str:
-    """에러 응답 JSON 에서 서버가 준 설명을 뽑는다 (CTFd·rCTF 는 message 를 준다)."""
+    """에러 응답 JSON 에서 서버가 준 설명을 뽑는다 (CTFd·rCTF 는 message, FastAPI 류는 detail)."""
     if isinstance(payload, dict):
-        msg = payload.get("message") or payload.get("title") or ""
+        msg = payload.get("message") or payload.get("title") or payload.get("detail") or ""
         return str(msg).strip()[:200]
     return ""
 
@@ -111,6 +111,7 @@ async def _with_details(
     out: list[Challenge] = []
     handled = 0
     fails = 0
+    last_error: PlatformUnavailable | None = None
     for (rid, name, category), is_known in zip(entries, known):
         if is_known:
             out.append(Challenge(remote_id=rid, name=name, category=category))
@@ -122,8 +123,9 @@ async def _with_details(
         await asyncio.sleep(DETAIL_DELAY)  # 연속 요청 레이트리밋 회피
         try:
             description, files = await fetch_detail(rid)
-        except PlatformUnavailable:
+        except PlatformUnavailable as exc:
             fails += 1
+            last_error = exc
             ctx.deferred.append(name)
         else:
             fails = 0
@@ -142,7 +144,8 @@ async def _with_details(
             except Exception:
                 pass  # 진행률 표시 실패가 임포트를 망치면 안 된다
     if not out and ctx.deferred:
-        raise PlatformUnavailable(SERVER_UNAVAILABLE_MSG)
+        # 마지막 실패 이유를 그대로 알린다 (서버 무응답인지, 토큰 만료인지).
+        raise PlatformUnavailable(str(last_error) if last_error else SERVER_UNAVAILABLE_MSG)
     return out
 
 
@@ -775,6 +778,119 @@ async def _gzctf_detail(
     return description, tuple(files)
 
 
+# ---------- Flugsicherung (Platypwn 자체 플랫폼) ----------
+
+FLUG_TOKEN_EXPIRED = (
+    "Flugsicherung: 토큰이 만료됐거나 틀렸어. 이 플랫폼 로그인 토큰은 **3분짜리**라 저장해두면 "
+    "금방 만료돼. 브라우저에서 새로 복사해 바로 `/ctf import token:…` 해줘."
+)
+
+
+async def _flugsicherung_api(url: str) -> tuple[str, bool]:
+    """(API 주소, 이 플랫폼이 확실한지). 화면 주소면 그 사이트 /env.js 의 API_BASE_URL 을 읽는다 (요청 1번).
+
+    env.js 에 Flugsicherung 표시(OIDC client 이름)가 있으면 확실하다고 본다 — 그때만 401 을
+    '토큰 만료'로 단정한다. api.* 주소를 직접 준 경우는 다른 플랫폼일 수도 있어 단정하지 않는다.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if (parsed.hostname or "").startswith("api."):
+        return re.sub(r"/v1$", "", url.rstrip("/")), False
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    body = await download(f"{origin}/env.js", 64 * 1024) or b""
+    match = re.search(rb"API_BASE_URL\s*=\s*['\"]([^'\"]+)['\"]", body)
+    if not match:
+        raise PlatformError("Flugsicherung: 사이트에서 API 주소(env.js 의 API_BASE_URL)를 못 찾았어.")
+    api = urllib.parse.urljoin(origin + "/", match.group(1).decode()).rstrip("/")
+    return api, b"flugsicherung" in body.lower()
+
+
+async def fetch_flugsicherung(
+    url: str, token: str, ctx: FetchContext | None = None
+) -> list[Challenge]:
+    """Flugsicherung (Platypwn): 목록(GET /v1/challenges/) → 문제별 상세(설명·첨부 압축본).
+
+    토큰은 브라우저 로그인(Keycloak) 토큰 `Bearer eyJ…`. 수명이 3분 정도라 저장해두는 방식은
+    안 되고, 복사해서 바로 `/ctf import token:` 으로 쓴다. 분야 이름은 /v1/categories/ 에 있다.
+    """
+    token = token.strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    api, confirmed = await _flugsicherung_api(url)
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+
+    async with _make_session(timeout=TIMEOUT) as session:
+        status, payload = await _request(session, "GET", f"{api}/v1/challenges/", headers=headers)
+        if status == 401:
+            # 플랫폼이 확실하면 다른 플랫폼으로 헛시도하지 않고 바로 알린다.
+            raise (PlatformRejected if confirmed else PlatformError)(FLUG_TOKEN_EXPIRED)
+        if status == 403 and confirmed:
+            reason = _server_message(payload)
+            raise PlatformRejected(
+                f"Flugsicherung: 문제를 볼 수 없어 ({reason or '대회 시작 전이거나 팀 미가입'})."
+            )
+        if status != 200 or not isinstance(payload, list):
+            if _is_transient(status, payload):
+                raise PlatformUnavailable(SERVER_UNAVAILABLE_MSG)
+            reason = _server_message(payload)
+            raise PlatformError(f"Flugsicherung: 문제 목록을 읽지 못했어 (HTTP {status}) {reason}".strip())
+
+        # 분야는 slug 로만 오므로 이름표를 한 번 받아 둔다. 실패해도 slug 로 진행.
+        names = {}
+        cstatus, cats = await _request(session, "GET", f"{api}/v1/categories/", headers=headers)
+        if cstatus == 200 and isinstance(cats, list):
+            names = {c.get("slug"): c.get("name") for c in cats if isinstance(c, dict)}
+
+        entries = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            slug = item.get("slug")
+            name = (item.get("name") or "").strip()
+            if not slug or not name:
+                continue
+            cat = item.get("categorySlug") or "misc"
+            entries.append((str(slug), name, (names.get(cat) or cat).strip() or "misc"))
+        challenges = await _with_details(
+            entries, lambda slug: _flugsicherung_detail(session, api, headers, slug), ctx
+        )
+
+    if not challenges:
+        raise PlatformError("Flugsicherung: 문제가 하나도 없습니다. 대회 시작 전일 수 있습니다.")
+    return challenges
+
+
+async def _flugsicherung_detail(
+    session: aiohttp.ClientSession, api: str, headers: dict, slug: str
+) -> tuple[str, tuple[Attachment, ...]]:
+    """문제 하나의 설명 + 첨부 압축본(staticFilesArchiveUrl, 인증 없이 받는 링크).
+
+    받는 도중 3분 토큰이 만료되면(401) 빈 설명으로 만들지 않고 미룬다 — 새 토큰으로 다시 import.
+    """
+    try:
+        status, payload = await _request(
+            session, "GET", f"{api}/v1/challenges/{urllib.parse.quote(slug, safe='')}", headers=headers
+        )
+    except PlatformUnavailable:
+        raise
+    except PlatformError:
+        return "", ()
+    if status == 401:
+        raise PlatformUnavailable(FLUG_TOKEN_EXPIRED)
+    if _is_transient(status, payload):
+        raise PlatformUnavailable(SERVER_UNAVAILABLE_MSG)
+    if status != 200 or not isinstance(payload, dict):
+        return "", ()
+
+    description = (payload.get("description") or "").strip()
+    files = []
+    furl = payload.get("staticFilesArchiveUrl")
+    if furl:
+        full = urllib.parse.urljoin(api + "/", furl)
+        fname = urllib.parse.unquote(urllib.parse.urlparse(full).path.rsplit("/", 1)[-1])
+        files.append(Attachment(name=fname or f"{slug}-files", url=full))
+    return description, tuple(files)
+
+
 async def download(url: str, max_bytes: int) -> bytes | None:
     """첨부파일 다운로드. 시간 초과·연결 끊김이면 그 파일만 건너뛴다 (None)."""
     try:
@@ -877,6 +993,8 @@ async def _probe_site(url: str) -> dict:
         "cloudflare": any(m in low for m in _CLOUDFLARE_MARKERS),
         "spa": any(m in low for m in _SPA_MARKERS),
         "ctfd": "ctfd" in low,
+        # 런타임 설정을 /env.js 로 싣는 SPA (Flugsicherung 등) — 그 fetcher 를 먼저 시도한다.
+        "envjs": "/env.js" in low,
     }
 
 
@@ -887,6 +1005,7 @@ FETCHERS = {
     "rctf": fetch_rctf,
     "noctf": fetch_noctf,
     "gzctf": fetch_gzctf,
+    "flugsicherung": fetch_flugsicherung,
 }
 
 
@@ -915,10 +1034,11 @@ async def fetch_challenges(
             "문제를 수동으로 등록해줘 (`/ctf createchallenge`)."
         )
 
-    # CTFd 표시가 보이면 CTFd 를 먼저 시도한다 (엉뚱한 순서로 헛요청을 줄인다).
+    # 지문이 가리키는 플랫폼을 먼저 시도한다 (엉뚱한 순서로 헛요청을 줄인다).
     order = list(FETCHERS.items())
-    if info.get("ctfd"):
-        order.sort(key=lambda kv: kv[0] != "ctfd")
+    first = "ctfd" if info.get("ctfd") else "flugsicherung" if info.get("envjs") else None
+    if first:
+        order.sort(key=lambda kv: kv[0] != first)
 
     errors = []
     for name, fetcher in order:
@@ -943,7 +1063,7 @@ async def fetch_challenges(
         )
 
     raise PlatformError(
-        f"`{url}` 을(를) 지원하는 플랫폼(CTFd, rCTF, noCTF, GZCTF)으로 인식하지 못했습니다.\n"
+        f"`{url}` 을(를) 지원하는 플랫폼(CTFd, rCTF, noCTF, GZCTF, Flugsicherung)으로 인식하지 못했습니다.\n"
         + detail
         + "\n\n주소가 대회 사이트의 **첫 페이지**인지 확인해주세요 "
         "(문제 페이지 주소가 아니라 `https://ctf.example.com` 형태)."
