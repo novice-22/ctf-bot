@@ -69,6 +69,15 @@ CREATE TABLE IF NOT EXISTS seen_categories (
     name     TEXT    NOT NULL,
     PRIMARY KEY (guild_id, name)
 );
+
+-- 역할 선택 메시지 (/ctf role): 이 메시지에 이 이모지를 누르면 이 역할을 준다.
+CREATE TABLE IF NOT EXISTS reaction_roles (
+    message_id INTEGER NOT NULL,
+    emoji      TEXT    NOT NULL,
+    role_id    INTEGER NOT NULL,
+    guild_id   INTEGER NOT NULL,
+    PRIMARY KEY (message_id, emoji)
+);
 """
 
 _conn: aiosqlite.Connection | None = None
@@ -515,6 +524,33 @@ async def alias_map(guild_id: int) -> dict[str, str]:
         "SELECT alias, canonical FROM category_aliases WHERE guild_id = ?", (guild_id,)
     )
     return {row["alias"]: row["canonical"] for row in await cur.fetchall()}
+
+
+def _emoji_key(emoji: str) -> str:
+    """이모지 비교용 키. 1️⃣ 처럼 변형 선택자(U+FE0F)가 붙었다 안 붙었다 해도 같게 본다."""
+    return str(emoji).replace("️", "")
+
+
+async def add_reaction_roles(
+    guild_id: int, message_id: int, pairs: list[tuple[str, int]]
+) -> None:
+    """역할 선택 메시지 하나의 (이모지, 역할 ID) 목록을 저장한다."""
+    await conn().executemany(
+        "INSERT OR REPLACE INTO reaction_roles (message_id, emoji, role_id, guild_id) "
+        "VALUES (?, ?, ?, ?)",
+        [(message_id, _emoji_key(e), role_id, guild_id) for e, role_id in pairs],
+    )
+    await conn().commit()
+
+
+async def reaction_role(message_id: int, emoji: str) -> int | None:
+    """그 메시지의 그 이모지에 걸린 역할 ID (역할 선택 메시지가 아니면 None)."""
+    cur = await conn().execute(
+        "SELECT role_id FROM reaction_roles WHERE message_id = ? AND emoji = ?",
+        (message_id, _emoji_key(emoji)),
+    )
+    row = await cur.fetchone()
+    return row["role_id"] if row else None
 
 
 async def add_seen_category(guild_id: int, name: str) -> None:

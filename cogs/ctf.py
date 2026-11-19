@@ -349,6 +349,14 @@ async def _challenge_autocomplete(
 # 몇 명씩만 보여주고 검색해야 해서, 목록형 Select 로 만든다). 옵션은 최대 25개.
 MEMBER_SELECT_LIMIT = 25
 
+# 역할 선택 메시지(/ctf role). 이모지를 누르면 그 역할을 받고, 다시 누르면 뺀다.
+# 메시지 하나의 반응은 최대 20종이라 숫자 10개 + 알파벳 10개까지.
+ROLE_CHANNEL_NAME = "role"
+ROLE_EMOJIS = (
+    "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟",
+    "🇦", "🇧", "🇨", "🇩", "🇪", "🇫", "🇬", "🇭", "🇮", "🇯",
+)
+
 
 class _MemberActionSelect(discord.ui.Select):
     def __init__(self, ctf_id: int, role_id: int, mode: str, members: list) -> None:
@@ -752,7 +760,8 @@ class CTF(commands.Cog):
             value=(
                 "`/ctf schedule ends:2026-10-20 21:00` → 일정 변경 (공지도 같이 수정)\n"
                 "`/ctf archive` → 스레드 접어 정리 (종료 3일 뒤엔 자동)\n"
-                "`/ctf delete name:대회이름` → 대회 통째 삭제 (삭제 전 백업)"
+                "`/ctf delete name:대회이름` → 대회 통째 삭제 (삭제 전 백업)\n"
+                "`/ctf role names:Holiday, Onyx` → #role 채널에 이모지로 고르는 역할 선택 메시지"
             ),
             inline=False,
         )
@@ -1662,6 +1671,91 @@ class CTF(commands.Cog):
         await interaction.response.send_message(
             f"`{slug}` → **{saved[slug]}** 별칭을 지웠어.{note}", ephemeral=True
         )
+
+    # ---------- 역할 선택 ----------
+
+    @group.command(name="role", description="이모지를 누르면 역할을 받는 선택 메시지를 #role 채널에 만들게")
+    @app_commands.describe(
+        names="역할 이름들 — 쉼표로 구분, 최대 20개 (예: Holiday, Sapphires, Onyx)",
+        title="메시지 제목 (기본: 역할을 선택해주세요!)",
+    )
+    @lead_only()
+    async def role(
+        self, interaction: discord.Interaction, names: str, title: str | None = None
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        # 쉼표로 나눈 이름들. 대소문자만 다른 중복은 하나로.
+        wanted: list[str] = []
+        for raw in names.split(","):
+            name = raw.strip()[:100]
+            if name and name.lower() not in (w.lower() for w in wanted):
+                wanted.append(name)
+        if not wanted:
+            await interaction.followup.send("역할 이름을 쉼표로 구분해서 적어줘.", ephemeral=True)
+            return
+        if len(wanted) > len(ROLE_EMOJIS):
+            await interaction.followup.send(
+                f"한 메시지에 {len(ROLE_EMOJIS)}개까지만 돼. 나눠서 만들어줘.", ephemeral=True
+            )
+            return
+
+        # 이름이 같은 역할이 있으면 그걸 쓰고, 없으면 만든다 (권한 없는 빈 역할).
+        # 봇보다 높은 역할·봇 연동 역할은 봇이 줄 수 없으므로 뺀다.
+        picked: list[discord.Role] = []
+        created: list[str] = []
+        skipped: list[str] = []
+        for name in wanted:
+            role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
+            if role is None:
+                role = await guild.create_role(name=name, reason="역할 선택 메시지")
+                created.append(name)
+            elif role.managed or role.is_default() or role.position >= guild.me.top_role.position:
+                skipped.append(role.name)
+                continue
+            picked.append(role)
+        if not picked:
+            await interaction.followup.send(
+                "줄 수 있는 역할이 없어 — 봇 역할보다 높은 역할은 줄 수 없어. "
+                f"(못 쓴 역할: {', '.join(skipped)})",
+                ephemeral=True,
+            )
+            return
+
+        # #role 채널: 모두 볼 수 있지만 글쓰기·새 이모지 달기는 막는다 (봇이 단 이모지만 누르게).
+        channel = discord.utils.find(
+            lambda c: structure.strip_emoji(c.name) == ROLE_CHANNEL_NAME, guild.text_channels
+        )
+        if channel is None:
+            channel = await guild.create_text_channel(
+                ROLE_CHANNEL_NAME,
+                overwrites={
+                    guild.default_role: discord.PermissionOverwrite(
+                        send_messages=False, add_reactions=False
+                    ),
+                    guild.me: discord.PermissionOverwrite(
+                        view_channel=True, send_messages=True, add_reactions=True
+                    ),
+                },
+                reason="역할 선택 채널",
+            )
+
+        pairs = list(zip(ROLE_EMOJIS, picked))
+        lines = [f"**{title or '역할을 선택해주세요!'}**"]
+        lines += [f"{emoji} {role.name}" for emoji, role in pairs]
+        message = await channel.send("\n".join(lines))
+        # 이모지를 달기 전에 저장한다 — 다는 도중 누른 사람도 역할을 받게.
+        await db.add_reaction_roles(guild.id, message.id, [(e, r.id) for e, r in pairs])
+        for emoji, _ in pairs:
+            await message.add_reaction(emoji)
+
+        result = f"✅ {channel.mention} 에 역할 선택 메시지를 만들었어 ({len(pairs)}개)."
+        if created:
+            result += f"\n새로 만든 역할: {', '.join(created)}"
+        if skipped:
+            result += f"\n⚠️ 봇보다 높은 역할이라 뺐어: {', '.join(skipped)}"
+        await interaction.followup.send(result, ephemeral=True)
 
     # ---------- 현황 ----------
 

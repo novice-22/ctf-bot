@@ -108,6 +108,37 @@ class Events(commands.Cog):
                 ctf["name"],
             )
 
+    # ---------- 역할 선택 메시지 (/ctf role) ----------
+    # raw 이벤트를 쓴다 — 봇이 재시작해서 메시지가 캐시에 없어도 계속 동작하게.
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        await self._reaction_role(payload, add=True)
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
+        await self._reaction_role(payload, add=False)
+
+    async def _reaction_role(self, payload: discord.RawReactionActionEvent, add: bool) -> None:
+        if payload.guild_id is None or payload.user_id == self.bot.user.id:
+            return
+        role_id = await db.reaction_role(payload.message_id, str(payload.emoji))
+        if role_id is None:
+            return  # 역할 선택 메시지가 아님
+        guild = self.bot.get_guild(payload.guild_id)
+        role = guild.get_role(role_id) if guild else None
+        member = payload.member if add else (guild.get_member(payload.user_id) if guild else None)
+        if role is None or member is None or member.bot:
+            return
+        try:
+            if add:
+                await member.add_roles(role, reason="역할 선택")
+            else:
+                await member.remove_roles(role, reason="역할 선택 해제")
+        except discord.HTTPException as exc:
+            # 봇보다 높아진 역할 등 — 그 사람만 안 될 뿐 봇은 계속 돈다.
+            log.warning("역할 선택 처리 실패 (%s, %s): %s", member, role.name, exc)
+
     @staticmethod
     def _find_url(event: discord.ScheduledEvent) -> str | None:
         """이벤트 위치/설명에 적힌 대회 주소를 찾는다."""
