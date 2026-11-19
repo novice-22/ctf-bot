@@ -411,7 +411,7 @@ docker logs -f ctf-bot     # "로그인: 봇이름#1234" 확인 후 Ctrl+C (봇�
 | `/ctf archive` 🔒 | 대회 정리 — 스레드 접기 (종료 3일 뒤엔 자동) |
 | `/ctf delete` 🔒 | 대회 통째로 삭제 (삭제 전 백업) |
 | `/ctf role` 🔒 | `#role` 채널에 역할 선택 메시지 — 이모지(1️⃣2️⃣…)를 누르면 역할을 받고, 떼면 빠짐. `names:` 에 쉼표로 여러 개 (최대 20, 없는 역할은 새로 만듦) |
-| `/ctf field` 🔒 | 옵션 없이 치면 주력 분야 선택 메시지 (⚔️ Pwn · 🌐 Web · ⚙️ Reverse · 🔐 Crypto · 🔎 Forensics · 📱 Mobile · 🖥️ Hardware · 🌍 OSINT · 💡 Misc, 중복 가능) |
+| `/ctf field` 🔒 | 옵션 없이 치면 주력 분야 선택 메시지 (⚔️ Pwn · 🌐 Web · ⚙️ Reverse · 🔐 Crypto · 🔎 Forensics · 📱 Mobile · 🖥️ Hardware · 🌍 OSINT · 💡 Misc, 중복 가능). 더 넣으려면 `extra:AI, Blockchain` — 이모지를 앞에 붙이면 그걸로 (`🦀 Rust`), 안 붙이면 자동 |
 
 ---
 

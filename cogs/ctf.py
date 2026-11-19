@@ -369,6 +369,25 @@ FIELD_ROLES = (
     ("🌍", "OSINT"),
     ("💡", "Misc"),
 )
+# /ctf field extra: 로 더한 분야에 이모지를 안 붙였으면 아는 이름은 이걸, 모르면 1️⃣2️⃣… 를 붙인다.
+EXTRA_FIELD_EMOJIS = {
+    "ai": "🤖",
+    "cloud": "☁️",
+    "blockchain": "⛓️",
+    "network": "📡",
+    "stego": "🖼️",
+    "game": "🎮",
+    "ppc": "🧮",
+}
+CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+
+
+def _split_emoji(item: str) -> tuple[str | None, str]:
+    """'🤖 AI' → ('🤖', 'AI'), 'AI' → (None, 'AI'). 맨 앞 토큰이 이모지(서버 이모지 포함)면 떼어낸다."""
+    head, _, rest = item.strip().partition(" ")
+    if rest.strip() and (CUSTOM_EMOJI_RE.fullmatch(head) or not any(c.isalnum() for c in head)):
+        return head, rest.strip()
+    return None, item.strip()
 
 
 async def _post_role_picker(
@@ -431,7 +450,10 @@ async def _post_role_picker(
     # 이모지를 달기 전에 저장한다 — 다는 도중 누른 사람도 역할을 받게.
     await db.add_reaction_roles(guild.id, message.id, [(e, r.id) for e, r in pairs])
     for emoji, _ in pairs:
-        await message.add_reaction(emoji)
+        # 서버 이모지(<:이름:ID>)는 문자열 그대로는 못 달아서 바꿔서 단다.
+        await message.add_reaction(
+            discord.PartialEmoji.from_str(emoji) if emoji.startswith("<") else emoji
+        )
 
     result = f"✅ {channel.mention} 에 역할 선택 메시지를 만들었어 ({len(pairs)}개)."
     if created:
@@ -846,7 +868,7 @@ class CTF(commands.Cog):
                 "`/ctf archive` → 스레드 접어 정리 (종료 3일 뒤엔 자동)\n"
                 "`/ctf delete name:대회이름` → 대회 통째 삭제 (삭제 전 백업)\n"
                 "`/ctf role names:Holiday, Onyx` → #role 채널에 이모지로 고르는 역할 선택 메시지\n"
-                "`/ctf field` → 주력 분야(Pwn·Web·Reverse…) 선택 메시지 (옵션 없이)"
+                "`/ctf field` → 주력 분야(Pwn·Web·Reverse…) 선택 메시지 (`extra:AI, 🦀 Rust` 로 추가)"
             ),
             inline=False,
         )
@@ -1787,15 +1809,41 @@ class CTF(commands.Cog):
         await _post_role_picker(interaction, title or "역할을 선택해주세요!", wanted)
 
     @group.command(name="field", description="주력 분야(Pwn·Web·Reverse…) 선택 메시지를 #role 채널에 만들게")
+    @app_commands.describe(
+        extra="기본 9개 말고 더 넣을 분야 — 쉼표로 (예: AI, Blockchain). 이모지를 앞에 붙이면 그걸로 (🤖 AI)",
+    )
     @lead_only()
-    async def field(self, interaction: discord.Interaction) -> None:
+    async def field(self, interaction: discord.Interaction, extra: str | None = None) -> None:
         await interaction.response.defer(ephemeral=True)
-        await _post_role_picker(
-            interaction,
-            FIELD_TITLE,
-            [name for _, name in FIELD_ROLES],
-            {name: emoji for emoji, name in FIELD_ROLES},
-        )
+        names = [name for _, name in FIELD_ROLES]
+        emojis = {name: emoji for emoji, name in FIELD_ROLES}
+
+        # 더할 분야: 기본에 이미 있는 이름(대소문자 무시)·중복은 뺀다.
+        extras: list[tuple[str | None, str]] = []
+        for raw in (extra or "").split(","):
+            emoji, name = _split_emoji(raw)
+            name = name[:100]
+            taken = [n.lower() for n in names] + [n.lower() for _, n in extras]
+            if name and name.lower() not in taken:
+                extras.append((emoji, name))
+        if len(names) + len(extras) > len(ROLE_EMOJIS):
+            await interaction.followup.send(
+                f"분야는 기본 {len(names)}개 포함 {len(ROLE_EMOJIS)}개까지만 돼 "
+                f"(추가는 {len(ROLE_EMOJIS) - len(names)}개까지).",
+                ephemeral=True,
+            )
+            return
+
+        # 이모지가 겹치면 같은 반응이 두 역할을 가리키게 되므로, 겹치면 다음 후보로 넘긴다.
+        used = {e.replace("️", "") for e in emojis.values()}
+        for emoji, name in extras:
+            for candidate in (emoji, EXTRA_FIELD_EMOJIS.get(name.lower()), *ROLE_EMOJIS):
+                if candidate and candidate.replace("️", "") not in used:
+                    break
+            used.add(candidate.replace("️", ""))
+            names.append(name)
+            emojis[name] = candidate
+        await _post_role_picker(interaction, FIELD_TITLE, names, emojis)
 
     # ---------- 현황 ----------
 
