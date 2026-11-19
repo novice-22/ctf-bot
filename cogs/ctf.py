@@ -356,6 +356,90 @@ ROLE_EMOJIS = (
     "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟",
     "🇦", "🇧", "🇨", "🇩", "🇪", "🇫", "🇬", "🇭", "🇮", "🇯",
 )
+# /ctf field — 옵션 없이 치면 이 목록 그대로 만든다. (이모지, 역할 이름)
+FIELD_TITLE = "주력 분야를 선택해주세요! (중복가능)"
+FIELD_ROLES = (
+    ("⚔️", "Pwn"),
+    ("🌐", "Web"),
+    ("⚙️", "Reverse"),
+    ("🔐", "Crypto"),
+    ("🔎", "Forensics"),
+    ("📱", "Mobile"),
+    ("🖥️", "Hardware"),
+    ("🌍", "OSINT"),
+    ("💡", "Misc"),
+)
+
+
+async def _post_role_picker(
+    interaction: discord.Interaction,
+    title: str,
+    names: list[str],
+    emojis: dict[str, str] | None = None,
+) -> None:
+    """#role 채널에 역할 선택 메시지를 올리고 이모지를 단다 (/ctf role, /ctf field 공용).
+
+    이름이 같은 역할이 있으면 그걸 쓰고, 없으면 권한 없는 빈 역할로 만든다. 봇보다 높은
+    역할·봇 연동 역할은 봇이 줄 수 없으므로 빼고 알린다. emojis 를 주면 이름마다 그 이모지를,
+    안 주면 1️⃣2️⃣… 를 순서대로 붙인다.
+    """
+    guild = interaction.guild
+    picked: list[tuple[str, discord.Role]] = []
+    created: list[str] = []
+    skipped: list[str] = []
+    for name in names:
+        role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
+        if role is None:
+            role = await guild.create_role(name=name, reason="역할 선택 메시지")
+            created.append(name)
+        elif role.managed or role.is_default() or role.position >= guild.me.top_role.position:
+            skipped.append(role.name)
+            continue
+        picked.append((name, role))
+    if not picked:
+        await interaction.followup.send(
+            "줄 수 있는 역할이 없어 — 봇 역할보다 높은 역할은 줄 수 없어. "
+            f"(못 쓴 역할: {', '.join(skipped)})",
+            ephemeral=True,
+        )
+        return
+
+    # #role 채널: 모두 볼 수 있지만 글쓰기·새 이모지 달기는 막는다 (봇이 단 이모지만 누르게).
+    channel = discord.utils.find(
+        lambda c: structure.strip_emoji(c.name) == ROLE_CHANNEL_NAME, guild.text_channels
+    )
+    if channel is None:
+        channel = await guild.create_text_channel(
+            ROLE_CHANNEL_NAME,
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(
+                    send_messages=False, add_reactions=False
+                ),
+                guild.me: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, add_reactions=True
+                ),
+            },
+            reason="역할 선택 채널",
+        )
+
+    pairs = [
+        (emojis[name] if emojis else ROLE_EMOJIS[i], role)
+        for i, (name, role) in enumerate(picked)
+    ]
+    lines = [f"**{title}**"] + [f"{emoji} {role.name}" for emoji, role in pairs]
+    message = await channel.send("\n".join(lines))
+    # 이모지를 달기 전에 저장한다 — 다는 도중 누른 사람도 역할을 받게.
+    await db.add_reaction_roles(guild.id, message.id, [(e, r.id) for e, r in pairs])
+    for emoji, _ in pairs:
+        await message.add_reaction(emoji)
+
+    result = f"✅ {channel.mention} 에 역할 선택 메시지를 만들었어 ({len(pairs)}개)."
+    if created:
+        result += f"\n새로 만든 역할: {', '.join(created)}"
+    if skipped:
+        result += f"\n⚠️ 봇보다 높은 역할이라 뺐어: {', '.join(skipped)}"
+    await interaction.followup.send(result, ephemeral=True)
+
 
 
 class _MemberActionSelect(discord.ui.Select):
@@ -761,7 +845,8 @@ class CTF(commands.Cog):
                 "`/ctf schedule ends:2026-10-20 21:00` → 일정 변경 (공지도 같이 수정)\n"
                 "`/ctf archive` → 스레드 접어 정리 (종료 3일 뒤엔 자동)\n"
                 "`/ctf delete name:대회이름` → 대회 통째 삭제 (삭제 전 백업)\n"
-                "`/ctf role names:Holiday, Onyx` → #role 채널에 이모지로 고르는 역할 선택 메시지"
+                "`/ctf role names:Holiday, Onyx` → #role 채널에 이모지로 고르는 역할 선택 메시지\n"
+                "`/ctf field` → 주력 분야(Pwn·Web·Reverse…) 선택 메시지 (옵션 없이)"
             ),
             inline=False,
         )
@@ -1684,7 +1769,6 @@ class CTF(commands.Cog):
         self, interaction: discord.Interaction, names: str, title: str | None = None
     ) -> None:
         await interaction.response.defer(ephemeral=True)
-        guild = interaction.guild
 
         # 쉼표로 나눈 이름들. 대소문자만 다른 중복은 하나로.
         wanted: list[str] = []
@@ -1700,62 +1784,18 @@ class CTF(commands.Cog):
                 f"한 메시지에 {len(ROLE_EMOJIS)}개까지만 돼. 나눠서 만들어줘.", ephemeral=True
             )
             return
+        await _post_role_picker(interaction, title or "역할을 선택해주세요!", wanted)
 
-        # 이름이 같은 역할이 있으면 그걸 쓰고, 없으면 만든다 (권한 없는 빈 역할).
-        # 봇보다 높은 역할·봇 연동 역할은 봇이 줄 수 없으므로 뺀다.
-        picked: list[discord.Role] = []
-        created: list[str] = []
-        skipped: list[str] = []
-        for name in wanted:
-            role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
-            if role is None:
-                role = await guild.create_role(name=name, reason="역할 선택 메시지")
-                created.append(name)
-            elif role.managed or role.is_default() or role.position >= guild.me.top_role.position:
-                skipped.append(role.name)
-                continue
-            picked.append(role)
-        if not picked:
-            await interaction.followup.send(
-                "줄 수 있는 역할이 없어 — 봇 역할보다 높은 역할은 줄 수 없어. "
-                f"(못 쓴 역할: {', '.join(skipped)})",
-                ephemeral=True,
-            )
-            return
-
-        # #role 채널: 모두 볼 수 있지만 글쓰기·새 이모지 달기는 막는다 (봇이 단 이모지만 누르게).
-        channel = discord.utils.find(
-            lambda c: structure.strip_emoji(c.name) == ROLE_CHANNEL_NAME, guild.text_channels
+    @group.command(name="field", description="주력 분야(Pwn·Web·Reverse…) 선택 메시지를 #role 채널에 만들게")
+    @lead_only()
+    async def field(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await _post_role_picker(
+            interaction,
+            FIELD_TITLE,
+            [name for _, name in FIELD_ROLES],
+            {name: emoji for emoji, name in FIELD_ROLES},
         )
-        if channel is None:
-            channel = await guild.create_text_channel(
-                ROLE_CHANNEL_NAME,
-                overwrites={
-                    guild.default_role: discord.PermissionOverwrite(
-                        send_messages=False, add_reactions=False
-                    ),
-                    guild.me: discord.PermissionOverwrite(
-                        view_channel=True, send_messages=True, add_reactions=True
-                    ),
-                },
-                reason="역할 선택 채널",
-            )
-
-        pairs = list(zip(ROLE_EMOJIS, picked))
-        lines = [f"**{title or '역할을 선택해주세요!'}**"]
-        lines += [f"{emoji} {role.name}" for emoji, role in pairs]
-        message = await channel.send("\n".join(lines))
-        # 이모지를 달기 전에 저장한다 — 다는 도중 누른 사람도 역할을 받게.
-        await db.add_reaction_roles(guild.id, message.id, [(e, r.id) for e, r in pairs])
-        for emoji, _ in pairs:
-            await message.add_reaction(emoji)
-
-        result = f"✅ {channel.mention} 에 역할 선택 메시지를 만들었어 ({len(pairs)}개)."
-        if created:
-            result += f"\n새로 만든 역할: {', '.join(created)}"
-        if skipped:
-            result += f"\n⚠️ 봇보다 높은 역할이라 뺐어: {', '.join(skipped)}"
-        await interaction.followup.send(result, ephemeral=True)
 
     # ---------- 현황 ----------
 
