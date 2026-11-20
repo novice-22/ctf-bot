@@ -282,6 +282,22 @@ async def _request(
         raise PlatformUnavailable(f"대회 사이트에 접속하지 못했어: {exc}") from exc
 
 
+async def _read_limited(resp: aiohttp.ClientResponse, limit: int) -> bytes:
+    """본문을 끝까지(최대 limit+1 바이트) 읽는다.
+
+    content.read(n) 은 n 바이트를 다 기다리지 않고 '지금 도착한 만큼'만 줄 수 있다.
+    한 번만 읽으면 큰 응답이 잘려 JSON 이 깨지고(→ '로그인 안 됨'으로 오판), 첨부파일이
+    잘린 채 올라간다. 그래서 끝(EOF)까지 반복해서 읽는다.
+    """
+    buf = bytearray()
+    while len(buf) <= limit:
+        chunk = await resp.content.read(min(65536, limit + 1 - len(buf)))
+        if not chunk:
+            break
+        buf += chunk
+    return bytes(buf)
+
+
 async def _request_once(
     session: aiohttp.ClientSession, method: str, url: str, **kwargs
 ) -> tuple[int, dict | None]:
@@ -327,7 +343,7 @@ async def _request_once(
                 continue
 
             # 응답 크기를 제한한다. 무한정 읽으면 메모리를 다 쓰고 컨테이너가 죽는다.
-            body = await resp.content.read(MAX_BODY + 1)
+            body = await _read_limited(resp, MAX_BODY)
             if len(body) > MAX_BODY:
                 raise PlatformError("응답이 너무 큽니다. 대회 사이트 주소가 맞는지 확인해주세요.")
             try:
@@ -929,7 +945,7 @@ async def _download_once(url: str, max_bytes: int) -> bytes | None:
                     continue
                 if resp.status != 200:
                     return None
-                data = await resp.content.read(max_bytes + 1)
+                data = await _read_limited(resp, max_bytes)
                 return None if len(data) > max_bytes else data
     return None
 
