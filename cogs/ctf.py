@@ -1342,6 +1342,17 @@ class CTF(commands.Cog):
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     pass
 
+        # 연결된 디스코드 이벤트도 지운다. 남겨두면 이벤트가 바뀔 때(시작 등) 봇이
+        # "대회가 없는 이벤트"로 보고 대회와 공지를 다시 만든다. DB 행을 지우기 전에 한다.
+        if ctf["event_id"]:
+            try:
+                event = await interaction.guild.fetch_scheduled_event(ctf["event_id"])
+                await event.delete(reason=f"CTF 삭제: {name}")
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                failed.append("디스코드 이벤트")
+
         await db.delete_ctf(ctf["id"])
         log.info("CTF 삭제: %s (백업: %s)", name, path.name if path else "꺼짐")
 
