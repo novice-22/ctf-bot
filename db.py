@@ -318,6 +318,11 @@ async def set_ctf_url(ctf_id: int, url: str) -> None:
     await conn().commit()
 
 
+async def set_platform(ctf_id: int, platform: str) -> None:
+    await conn().execute("UPDATE ctfs SET platform = ? WHERE id = ?", (platform, ctf_id))
+    await conn().commit()
+
+
 async def set_credentials(ctf_id: int, url: str, token: str, platform: str) -> None:
     """자동 임포트/pull 에 쓸 접속 정보를 보관한다."""
     await conn().execute(

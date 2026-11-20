@@ -388,6 +388,10 @@ async def fetch_ctfd(url: str, token: str, ctx: FetchContext | None = None) -> l
                     "(브라우저로는 문제가 보이는데 봇만 안 되면 거의 이 경우야)"
                 )
             raise PlatformError("CTFd: 인증이 거부됐습니다. 토큰이나 세션 쿠키를 확인해주세요.")
+        if status == 429 or status >= 500:
+            # 과부하·다운(502 등). 플랫폼이 틀린 게 아니라 '지금' 안 되는 것이라, 다른
+            # 플랫폼으로 헛요청을 보내지 않고 여기서 멈춘다.
+            raise PlatformUnavailable(f"{SERVER_UNAVAILABLE_MSG} (HTTP {status})")
         if status == 200 and not isinstance(payload, dict):
             # 일부 CTFd 는 미인증 요청을 403 대신 /login 으로 리다이렉트한다. 그러면
             # 로그인 HTML 이 와서 JSON 파싱이 안 된다 → 사실상 인증 문제로 본다.

@@ -263,6 +263,11 @@ async def _sync(
     ctx = platforms.FetchContext(skip=is_known, progress=fetch_progress)
     detected, challenges = await platforms.fetch_challenges(url, token, platform, ctx)
 
+    # 자동 판별로 알아낸 플랫폼을 기억한다 — 다음부터는 그 플랫폼으로 바로 간다
+    # (대회 서버가 과부하일 때 다른 플랫폼까지 두드려 보는 헛요청을 막는다).
+    if (ctf["platform"] or "auto") == "auto" and url == ctf["ctfd_url"]:
+        await db.set_platform(ctf["id"], detected)
+
     aliases = await db.alias_map(guild.id)
 
     # remote_id 로도, 이름으로도 중복을 막는다. 수동으로 만든 문제(remote_id 없음)와
